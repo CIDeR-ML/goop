@@ -24,8 +24,9 @@ SlicedWaveform (compressed) or Waveform (full)
 import torch
 from goop import (
     OpticalSimConfig, OpticalSimulator,
-    SERKernel, ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay,
 )
+from goop.kernels import SERKernel
+from goop.delays import ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay
 from goop.sampler import create_default_tof_sampler
 
 # configure
