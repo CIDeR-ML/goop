@@ -17,6 +17,7 @@ from goop import (
     Waveform,
     create_default_delays,
 )
+from goop.kernels import _rlc_antiderivative
 from goop.digitize import digitize
 
 DEVICE = torch.device("cpu")
@@ -125,8 +126,18 @@ class TestRLCKernel:
     def test_shape(self):
         assert RLCKernel(duration_ns=9000.0, device=DEVICE)().shape == (9000,)
 
-    def test_starts_zero(self):
-        assert abs(RLCKernel(device=DEVICE)()[0].item()) < 1e-7
+    def test_first_tick_is_bin_average_not_point_sample(self):
+        ker = RLCKernel(device=DEVICE)
+        k = ker()
+        edges = torch.tensor([0.0, ker.tick_ns], device=DEVICE, dtype=torch.float32)
+        F = _rlc_antiderivative(
+            edges, ker.tau_relax_ns, ker.tau_osc_ns, DEVICE, torch.float32
+        )
+        c = (ker.tau_osc_ns**2 + ker.tau_relax_ns**2) / (
+            ker.tau_osc_ns * ker.tau_relax_ns**2
+        )
+        ref = c * (F[1] - F[0]) / ker.tick_ns
+        assert torch.allclose(k[0], ref, atol=1e-5, rtol=1e-5)
 
     def test_decays_monotonically(self):
         """Peak envelope should decrease over time (damped oscillator)."""
