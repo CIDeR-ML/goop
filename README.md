@@ -9,12 +9,14 @@ edepsim steps (position, dE, t)
     |
     v
 1. Photon yield:  dE * light_yield -> n_photons per step
-2. TOF sampling:  photon library lookup + pmt QE (+ conversion efficiency in future?) -> arrival times & PMT channels
+2. TOF sampling:  photon library lookup + pmt QE -> arrival times & PMT channels
 3. Delays:        scintillation + TPB re-emission + PMT TTS jitter
 4. Aux sources:   dark noise injection (+ afterpulsing, crosstalk, etc.)
-5. Histogramming: bin photon times into per-channel waveforms
+5. Histogramming: bin photon times into per-channel waveforms (with optional SER jitter)
 6. Convolution:   FFT convolve with detector impulse response (SER kernel)
-7. Digitization:  pedestal + quantization + ADC saturation (optional)
+7. Downsample:    average oversampled fine bins to output resolution (if oversample > 1)
+8. Baseline noise: per-sample Gaussian ADC noise (optional)
+9. Digitization:  pedestal + quantization + ADC saturation (optional)
     |
     v
 SlicedWaveform (compressed) or Waveform (full)
@@ -41,13 +43,15 @@ config = OpticalSimConfig(
     ],
     kernel=SERKernel(device=torch.device("cuda")),
     gain=1.0,
-    tick_ns=1.0,
+    tick_ns=1.0,        # output bin width (ns)
+    oversample=10,      # convolve at 0.1 ns internally, downsample to 1 ns output
 )
 sim = OpticalSimulator(config)
 
 # simulate (inputs are (N,3) positions in mm, (N,) photon counts, (N,) times in ns)
 # accepts torch tensors or JAX arrays (auto-converted via dlpack)
 result = sim.simulate(pos, n_photons, t_step, stitched=True)
+result.attrs["pe_counts"]  # (n_channels,) detected PE per PMT
 ```
 
 ### With digitization and dark noise
@@ -64,8 +68,11 @@ config = OpticalSimConfig(
         TTSDelay(fwhm_ns=2.4),
     ],
     kernel=SERKernel(device=torch.device("cuda")),
-    tick_ns=2.0,       # 500 MHz
-    gain=-20.0,        # ADC counts per PE
+    tick_ns=2.0,               # 500 MHz output
+    gain=-20.0,                # ADC counts per PE
+    oversample=4,              # convolve at 0.5 ns internally
+    ser_jitter_std=0.1,        # 10% PE-to-PE gain fluctuation
+    baseline_noise_std=2.6,    # ADC baseline noise (std in ADC counts)
     aux_photon_sources=[DarkNoise(rate_hz=2000.0)],
     digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
 )
@@ -91,10 +98,13 @@ result.deslice_channel(ch) # decompress one PMT -> (t0, 1D tensor)
 
 **`Waveform`** (`stitched=False`) — full shared time axis:
 ```python
-result.data      # (n_channels, n_bins) tensor
+result.adc       # (n_channels, n_bins) tensor
 result.t0        # time origin (ns)
 result.tick_ns   # time bin width (ns)
+result.attrs     # dict of metadata (e.g. result.attrs["pe_counts"])
 ```
+
+Both types carry an `attrs` dict for arbitrary metadata. The simulator populates `attrs["pe_counts"]` with per-channel detected PE counts.
 
 Without digitization enabled, waveform values are **float32** (raw analog response). With `DigitizationConfig`, output values are integer-valued float32 in `[0, 2^n_bits - 1]`.
 
@@ -125,6 +135,13 @@ Each pipeline component is defined by an abstract base class (`base.py`), making
 |-----------|---------|-------------|
 | `n_bits` | 14 | ADC bit depth (14-bit → [0, 16383]) |
 | `pedestal` | 1500.0 | Baseline offset in ADC counts |
+
+**Simulator-level options** (`OpticalSimConfig`):
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `oversample` | 1 | Internal oversampling factor; bins and convolves at `tick_ns / oversample`, then averages down |
+| `ser_jitter_std` | 0.0 | Std of multiplicative Gaussian on per-PE weights (models dynode gain fluctuations) |
+| `baseline_noise_std` | 0.0 | Std of per-sample Gaussian ADC noise added post-convolution |
 
 Custom components just need to implement the relevant ABC and can be passed directly to `OpticalSimConfig`.
 
