@@ -170,31 +170,31 @@ class TestWaveformFromPhotons:
         channels = torch.tensor([0, 0, 0, 1, 1])
         wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=2)
         assert wf.n_channels == 2
-        assert wf.data.shape[0] == 2
-        assert wf.data[0].sum().item() == 3
-        assert wf.data[1].sum().item() == 2
+        assert wf.adc.shape[0] == 2
+        assert wf.adc[0].sum().item() == 3
+        assert wf.adc[1].sum().item() == 2
 
     def test_shared_time_axis(self):
         times = torch.tensor([0.0, 1.0, 500.0])
         channels = torch.tensor([0, 0, 1])
         wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=2)
-        assert wf.data.shape[1] == 501
-        assert wf.data[0].sum().item() == 2
-        assert wf.data[1].sum().item() == 1
+        assert wf.adc.shape[1] == 501
+        assert wf.adc[0].sum().item() == 2
+        assert wf.adc[1].sum().item() == 1
 
     def test_t0_preserved(self):
         times = torch.tensor([100.0, 200.0])
         channels = torch.tensor([0, 0])
         wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=1, t0=100.0)
         assert wf.t0 == 100.0
-        assert wf.data.shape[1] == 101
+        assert wf.adc.shape[1] == 101
 
     def test_empty(self):
         wf = Waveform.from_photons(
             torch.zeros(0), torch.zeros(0, dtype=torch.long),
             tick_ns=1.0, n_channels=2,
         )
-        assert wf.data.shape == (2, 1)
+        assert wf.adc.shape == (2, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -207,24 +207,24 @@ class TestEdgeCases:
         wf = Waveform.from_photons(
             torch.tensor([50.0]), torch.tensor([0]), tick_ns=1.0, n_channels=2,
         )
-        assert wf.data[0].sum().item() == 1
-        assert wf.data[1].sum().item() == 0
+        assert wf.adc[0].sum().item() == 1
+        assert wf.adc[1].sum().item() == 0
 
     def test_all_photons_same_time(self):
         times = torch.full((1000,), 42.0)
         channels = torch.zeros(1000, dtype=torch.long)
         wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=1)
-        assert wf.data[0].max().item() == 1000
-        assert (wf.data[0] > 0).sum().item() == 1
+        assert wf.adc[0].max().item() == 1000
+        assert (wf.adc[0] > 0).sum().item() == 1
 
     def test_all_photons_same_channel(self):
         times = torch.rand(100) * 100.0
         channels = torch.full((100,), 2, dtype=torch.long)
         wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=4)
-        assert wf.data[0].sum().item() == 0
-        assert wf.data[1].sum().item() == 0
-        assert wf.data[2].sum().item() == 100
-        assert wf.data[3].sum().item() == 0
+        assert wf.adc[0].sum().item() == 0
+        assert wf.adc[1].sum().item() == 0
+        assert wf.adc[2].sum().item() == 100
+        assert wf.adc[3].sum().item() == 0
 
     def test_slice_no_gaps(self):
         """Slicing a dense waveform (no gaps) should not change it."""
@@ -233,8 +233,8 @@ class TestEdgeCases:
         wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=1)
         sliced = wf.slice(kernel_extent_ns=470.0)
         # single chunk for the only channel, total adc bins = original bins
-        assert sliced.adc.numel() == wf.data.shape[1]
-        assert torch.allclose(sliced.adc, wf.data[0])
+        assert sliced.adc.numel() == wf.adc.shape[1]
+        assert torch.allclose(sliced.adc, wf.adc[0])
         # only 1 chunk total
         assert sliced.n_chunks == 1
 
@@ -283,8 +283,8 @@ class TestEdgeCases:
         kernel = RLCKernel(duration_ns=500.0, device=DEVICE)()
         convolved = wf.convolve(kernel, gain=1.0)
         n_k = kernel.numel()
-        assert convolved.data.shape[0] == 1
-        assert torch.allclose(convolved.data[0, :n_k], kernel, atol=1e-5)
+        assert convolved.adc.shape[0] == 1
+        assert torch.allclose(convolved.adc[0, :n_k], kernel, atol=1e-5)
 
     def test_times_before_t0_raises(self):
         with pytest.raises(ValueError, match="before t0"):
@@ -300,7 +300,7 @@ class TestEdgeCases:
             torch.tensor([0, 0, 0]),
             tick_ns=1.0, n_channels=1, t0=0.0,
         )
-        assert wf.data[0].sum().item() == 3
+        assert wf.adc[0].sum().item() == 3
 
     def test_delays_zero_photons(self):
         d = Delays([ScintillationBiexponentialDelay(), TPBExponentialDelay()])
@@ -338,8 +338,8 @@ class TestSimulateReturnsTypes:
         sim = _make_simulator()
         result = sim.simulate(torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10), stitched=False)
         assert isinstance(result, Waveform)
-        assert result.data.dim() == 2
-        assert result.data.shape[0] == 4
+        assert result.adc.dim() == 2
+        assert result.adc.shape[0] == 4
 
     def test_empty_photons(self):
         mock = MockTOFSampler(n_channels=4)
@@ -368,7 +368,7 @@ class TestDeslice:
         full = sliced.deslice()
         assert isinstance(full, Waveform)
         assert full.n_channels == 4
-        assert full.data.dim() == 2
+        assert full.adc.dim() == 2
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +403,7 @@ class TestFromPhotonsCrossConstruction:
         ).deslice()
 
         for ch in range(2):
-            assert abs(full.data[ch].sum().item() - recovered.data[ch].sum().item()) < 1e-3, (
+            assert abs(full.adc[ch].sum().item() - recovered.adc[ch].sum().item()) < 1e-3, (
                 f"ch {ch}: total count mismatch"
             )
 
@@ -456,9 +456,9 @@ class TestSliceDesliceClosure:
         assert recovered.n_channels == wf.n_channels
         assert recovered.tick_ns == wf.tick_ns
 
-        n_cmp = min(wf.data.shape[1], recovered.data.shape[1])
+        n_cmp = min(wf.adc.shape[1], recovered.adc.shape[1])
         for ch in range(wf.n_channels):
-            assert torch.allclose(wf.data[ch, :n_cmp], recovered.data[ch, :n_cmp], atol=1e-6), (
+            assert torch.allclose(wf.adc[ch, :n_cmp], recovered.adc[ch, :n_cmp], atol=1e-6), (
                 f"ch {ch}: data mismatch after slice->deslice"
             )
 
@@ -473,7 +473,7 @@ class TestSliceDesliceClosure:
         torch.manual_seed(42)
         wf = self._make_waveform()
         sliced = wf.slice(kernel_extent_ns=470.0)
-        orig_bins = wf.data.shape[1] * wf.n_channels
+        orig_bins = wf.adc.shape[1] * wf.n_channels
         sliced_bins = sliced.adc.numel()
         assert sliced_bins < orig_bins, (
             f"no compression occurred: {sliced_bins} >= {orig_bins} bins"
@@ -488,10 +488,10 @@ class TestSliceDesliceClosure:
         convolved = wf.convolve(kernel, gain=-45.0)
         recovered = convolved.slice(kernel_extent_ns=470.0).deslice()
 
-        n_cmp = min(convolved.data.shape[1], recovered.data.shape[1])
+        n_cmp = min(convolved.adc.shape[1], recovered.adc.shape[1])
         for ch in range(wf.n_channels):
             assert torch.allclose(
-                convolved.data[ch, :n_cmp], recovered.data[ch, :n_cmp], atol=1e-5
+                convolved.adc[ch, :n_cmp], recovered.adc[ch, :n_cmp], atol=1e-5
             ), f"ch {ch}: convolved data mismatch after slice->deslice"
 
     def test_slice_convolve_deslice_matches_convolve(self):
@@ -503,14 +503,14 @@ class TestSliceDesliceClosure:
         full = wf.convolve(kernel, gain=-45.0)
         via_sliced = wf.slice(kernel_extent_ns=2000.0).convolve(kernel, gain=-45.0).deslice()
 
-        assert full.data.shape == via_sliced.data.shape, (
-            f"shape mismatch: {full.data.shape} vs {via_sliced.data.shape}"
+        assert full.adc.shape == via_sliced.adc.shape, (
+            f"shape mismatch: {full.adc.shape} vs {via_sliced.adc.shape}"
         )
         for ch in range(wf.n_channels):
-            peak = full.data[ch].abs().max().item()
+            peak = full.adc[ch].abs().max().item()
             if peak < 1e-10:
                 continue
-            residual = (via_sliced.data[ch] - full.data[ch]).abs().max().item()
+            residual = (via_sliced.adc[ch] - full.adc[ch]).abs().max().item()
             assert residual / peak < 1e-5, (
                 f"ch {ch}: max |residual|/peak = {residual/peak:.6f}"
             )
@@ -532,10 +532,10 @@ class TestSliceDesliceClosure:
         full = sim.simulate(pos, n_ph, t_step, stitched=False)
         recovered = sliced.deslice()
 
-        n_cmp = min(recovered.data.shape[1], full.data.shape[1])
+        n_cmp = min(recovered.adc.shape[1], full.adc.shape[1])
         for ch in range(n_ch):
-            residual = recovered.data[ch, :n_cmp] - full.data[ch, :n_cmp]
-            peak = full.data[ch, :n_cmp].abs().max().item()
+            residual = recovered.adc[ch, :n_cmp] - full.adc[ch, :n_cmp]
+            peak = full.adc[ch, :n_cmp].abs().max().item()
             if peak < 1e-10:
                 continue
             max_rel = residual.abs().max().item() / peak
@@ -570,7 +570,7 @@ class TestStitchedMatchesFull:
 
         for ch in range(n_ch):
             t0, real_wf = sliced.deslice_channel(ch)
-            full_ch = full.data[ch]
+            full_ch = full.adc[ch]
 
             n_cmp = min(real_wf.numel(), full_ch.numel())
             if n_cmp == 0:
@@ -597,7 +597,7 @@ class TestDifferentTickNs:
         wf = Waveform.from_photons(times, channels, tick_ns=tick_ns, n_channels=3)
         for ch in range(3):
             expected = (channels == ch).sum().item()
-            assert abs(wf.data[ch].sum().item() - expected) < 1e-3
+            assert abs(wf.adc[ch].sum().item() - expected) < 1e-3
 
     @pytest.mark.parametrize("tick_ns", [0.5, 1.0, 2.0, 10.0])
     def test_slice_deslice_closure_across_ticks(self, tick_ns):
@@ -608,9 +608,9 @@ class TestDifferentTickNs:
         wf = Waveform.from_photons(times, channels, tick_ns=tick_ns, n_channels=2)
         recovered = wf.slice(kernel_extent_ns=470.0).deslice()
 
-        n_cmp = min(wf.data.shape[1], recovered.data.shape[1])
+        n_cmp = min(wf.adc.shape[1], recovered.adc.shape[1])
         for ch in range(2):
-            assert torch.allclose(wf.data[ch, :n_cmp], recovered.data[ch, :n_cmp], atol=1e-6), (
+            assert torch.allclose(wf.adc[ch, :n_cmp], recovered.adc[ch, :n_cmp], atol=1e-6), (
                 f"tick_ns={tick_ns}, ch {ch}: slice->deslice mismatch"
             )
 
@@ -623,7 +623,7 @@ class TestDifferentTickNs:
             wf = Waveform.from_photons(times, channels, tick_ns=tick_ns, n_channels=1)
             kernel = RLCKernel(duration_ns=500.0, tick_ns=tick_ns, device=DEVICE)
             convolved = wf.convolve(kernel(), gain=-1.0)
-            peaks[tick_ns] = convolved.data[0].abs().max().item()
+            peaks[tick_ns] = convolved.adc[0].abs().max().item()
 
         min_peak = min(peaks.values())
         max_peak = max(peaks.values())
@@ -681,16 +681,16 @@ class TestDigitize:
 class TestWaveformDigitize:
     def test_waveform_digitize(self):
         wf = Waveform(
-            data=torch.randn(2, 100) * 100,
+            adc=torch.randn(2, 100) * 100,
             t0=0.0, tick_ns=1.0, n_channels=2,
         )
         digitized = wf.digitize(pedestal=1500.0, n_bits=14)
         assert isinstance(digitized, Waveform)
-        assert digitized.data.shape == wf.data.shape
+        assert digitized.adc.shape == wf.adc.shape
         assert digitized.t0 == wf.t0
         assert digitized.tick_ns == wf.tick_ns
-        assert digitized.data.min().item() >= 0
-        assert digitized.data.max().item() <= 16383
+        assert digitized.adc.min().item() >= 0
+        assert digitized.adc.max().item() <= 16383
 
     def test_sliced_digitize(self):
         sw = SlicedWaveform(
@@ -721,10 +721,10 @@ class TestWaveformDigitize:
         sw_digitized = sliced.digitize(pedestal=1500.0, n_bits=14)
         recovered = sw_digitized.deslice()
 
-        n_cmp = min(wf_digitized.data.shape[1], recovered.data.shape[1])
+        n_cmp = min(wf_digitized.adc.shape[1], recovered.adc.shape[1])
         for ch in range(2):
             assert torch.equal(
-                wf_digitized.data[ch, :n_cmp], recovered.data[ch, :n_cmp]
+                wf_digitized.adc[ch, :n_cmp], recovered.adc[ch, :n_cmp]
             ), f"ch {ch}: digitized slice->deslice mismatch"
 
 
@@ -809,9 +809,9 @@ class TestPipelineDigitization:
             stitched=False,
         )
         assert isinstance(result, Waveform)
-        assert torch.equal(result.data, result.data.round())
-        assert result.data.min().item() >= 0
-        assert result.data.max().item() <= 16383
+        assert torch.equal(result.adc, result.adc.round())
+        assert result.adc.min().item() >= 0
+        assert result.adc.max().item() <= 16383
 
     def test_dark_noise_in_pipeline(self):
         sim = OpticalSimulator(OpticalSimConfig(
@@ -845,3 +845,370 @@ class TestPipelineDigitization:
         assert result.adc.min().item() >= 0
         assert result.adc.max().item() <= 16383
         assert torch.equal(result.adc, result.adc.round())
+
+
+# ---------------------------------------------------------------------------
+# Oversampling tests
+# ---------------------------------------------------------------------------
+
+from goop.kernels import SERKernel
+
+
+class TestKernelWithTickNs:
+    def test_rlc_shape_changes(self):
+        k = RLCKernel(duration_ns=500.0, tick_ns=1.0, device=DEVICE)
+        k_fine = k.with_tick_ns(0.25)
+        assert k_fine().shape[0] == 4 * k().shape[0]
+
+    def test_ser_shape_changes(self):
+        k = SERKernel(duration_ns=1000.0, tick_ns=1.0, device=DEVICE)
+        k_fine = k.with_tick_ns(0.5)
+        assert k_fine().shape[0] == 2 * k().shape[0]
+
+    def test_cache_cleared(self):
+        k = RLCKernel(duration_ns=500.0, tick_ns=1.0, device=DEVICE)
+        _ = k()  # populate cache
+        k_fine = k.with_tick_ns(0.5)
+        assert k_fine._kernel_cache is None
+
+    def test_original_unchanged(self):
+        k = RLCKernel(duration_ns=500.0, tick_ns=1.0, device=DEVICE)
+        original = k()
+        _ = k.with_tick_ns(0.25)
+        assert torch.equal(k(), original)
+
+
+class TestWaveformDownsample:
+    def test_identity(self):
+        wf = Waveform(adc=torch.randn(2, 20), t0=0.0, tick_ns=0.5, n_channels=2)
+        ds = wf.downsample(1)
+        assert ds is wf
+
+    def test_shape_and_tick(self):
+        wf = Waveform(adc=torch.randn(2, 20), t0=0.0, tick_ns=0.25, n_channels=2)
+        ds = wf.downsample(4)
+        assert ds.adc.shape == (2, 5)
+        assert ds.tick_ns == 1.0
+
+    def test_signal_preserved(self):
+        """Mean amplitude should be preserved after downsampling."""
+        wf = Waveform(adc=torch.randn(2, 40), t0=0.0, tick_ns=0.25, n_channels=2)
+        ds = wf.downsample(4)
+        for ch in range(2):
+            assert abs(wf.adc[ch].mean().item() - ds.adc[ch].mean().item()) < 1e-5
+
+    def test_t0_preserved(self):
+        wf = Waveform(adc=torch.randn(2, 20), t0=5.0, tick_ns=0.5, n_channels=2)
+        ds = wf.downsample(2)
+        assert ds.t0 == 5.0
+
+    def test_uneven_bins_padded(self):
+        """Bins not divisible by factor should still work."""
+        wf = Waveform(adc=torch.ones(1, 7), t0=0.0, tick_ns=0.5, n_channels=1)
+        ds = wf.downsample(4)
+        assert ds.adc.shape == (1, 2)
+        # first group: mean of [1,1,1,1] = 1.0; second: mean of [1,1,1,0] = 0.75
+        assert abs(ds.adc[0, 0].item() - 1.0) < 1e-6
+        assert abs(ds.adc[0, 1].item() - 0.75) < 1e-6
+
+
+class TestSlicedWaveformDownsample:
+    def test_identity(self):
+        sw = SlicedWaveform(
+            adc=torch.randn(20), offsets=torch.tensor([0, 20]),
+            t0_ns=torch.tensor([0.0]), pmt_id=torch.tensor([0]),
+            tick_ns=0.5, n_channels=1,
+        )
+        ds = sw.downsample(1)
+        assert ds is sw
+
+    def test_tick_updated(self):
+        sw = SlicedWaveform(
+            adc=torch.randn(20), offsets=torch.tensor([0, 20]),
+            t0_ns=torch.tensor([0.0]), pmt_id=torch.tensor([0]),
+            tick_ns=0.25, n_channels=1,
+        )
+        ds = sw.downsample(4)
+        assert ds.tick_ns == 1.0
+        assert ds.adc.numel() == 5
+
+    def test_signal_preserved(self):
+        sw = SlicedWaveform(
+            adc=torch.randn(40), offsets=torch.tensor([0, 20, 40]),
+            t0_ns=torch.tensor([0.0, 100.0]), pmt_id=torch.tensor([0, 1]),
+            tick_ns=0.25, n_channels=2,
+        )
+        ds = sw.downsample(4)
+        assert abs(sw.adc[:20].mean().item() - ds.adc[:5].mean().item()) < 1e-5
+        assert abs(sw.adc[20:].mean().item() - ds.adc[5:].mean().item()) < 1e-5
+
+
+class TestOversamplePipeline:
+    """Oversampled pipeline should match direct fine-resolution + manual downsample."""
+
+    def test_oversample_matches_fine_resolution(self):
+        """oversample=4 at tick_ns=1.0 should match tick_ns=0.25 then downsample."""
+        n_ch = 4
+        mock = _SeededMockTOF(n_channels=n_ch)
+        kernel = RLCKernel(duration_ns=500.0, tick_ns=1.0, device=DEVICE)
+
+        # oversampled pipeline
+        config_os = OpticalSimConfig(
+            tof_sampler=mock, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, oversample=4, gain=-1.0,
+        )
+        sim_os = OpticalSimulator(config_os)
+        result_os = sim_os.simulate(
+            torch.zeros(50, 3), torch.full((50,), 200), torch.zeros(50),
+            stitched=False,
+        )
+
+        # manual fine-resolution pipeline
+        mock2 = _SeededMockTOF(n_channels=n_ch)
+        kernel_fine = RLCKernel(duration_ns=500.0, tick_ns=0.25, device=DEVICE)
+        config_fine = OpticalSimConfig(
+            tof_sampler=mock2, delays=Delays([]), kernel=kernel_fine,
+            device="cpu", tick_ns=0.25, gain=-1.0,
+        )
+        sim_fine = OpticalSimulator(config_fine)
+        result_fine = sim_fine.simulate(
+            torch.zeros(50, 3), torch.full((50,), 200), torch.zeros(50),
+            stitched=False,
+        )
+        result_ds = result_fine.downsample(4)
+
+        n_cmp = min(result_os.adc.shape[1], result_ds.adc.shape[1])
+        for ch in range(n_ch):
+            peak = result_ds.adc[ch, :n_cmp].abs().max().item()
+            if peak < 1e-10:
+                continue
+            residual = (result_os.adc[ch, :n_cmp] - result_ds.adc[ch, :n_cmp]).abs().max().item()
+            assert residual / peak < 1e-4, (
+                f"ch {ch}: oversampled vs fine residual {residual/peak:.6f}"
+            )
+
+
+class TestOversampleStitchedMatchesFull:
+    """Stitched vs full closure should hold with oversampling."""
+
+    @pytest.mark.parametrize("oversample", [1, 2, 4])
+    def test_closure(self, oversample):
+        n_ch = 4
+        mock = _SeededMockTOF(n_channels=n_ch)
+        kernel = RLCKernel(duration_ns=2000.0, tick_ns=1.0, device=DEVICE)
+        config = OpticalSimConfig(
+            tof_sampler=mock, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, oversample=oversample, gain=-45.0,
+        )
+        sim = OpticalSimulator(config)
+        pos = torch.zeros(50, 3)
+        n_ph = torch.full((50,), 200)
+        t_step = torch.zeros(50)
+
+        sliced = sim.simulate(pos, n_ph, t_step, stitched=True)
+        full = sim.simulate(pos, n_ph, t_step, stitched=False)
+        recovered = sliced.deslice()
+
+        assert recovered.tick_ns == full.tick_ns
+        n_cmp = min(recovered.adc.shape[1], full.adc.shape[1])
+        for ch in range(n_ch):
+            peak = full.adc[ch, :n_cmp].abs().max().item()
+            if peak < 1e-10:
+                continue
+            residual = (recovered.adc[ch, :n_cmp] - full.adc[ch, :n_cmp]).abs().max().item()
+            assert residual / peak < 1e-3, (
+                f"oversample={oversample}, ch {ch}: residual/peak={residual/peak:.6f}"
+            )
+
+
+class TestOversampleBackwardCompat:
+    """oversample=1 should produce identical results to no oversampling."""
+
+    def test_identical_output(self):
+        n_ch = 4
+        mock1 = _SeededMockTOF(n_channels=n_ch)
+        mock2 = _SeededMockTOF(n_channels=n_ch)
+        kernel = RLCKernel(duration_ns=500.0, tick_ns=1.0, device=DEVICE)
+
+        config1 = OpticalSimConfig(
+            tof_sampler=mock1, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, gain=-45.0,
+        )
+        config2 = OpticalSimConfig(
+            tof_sampler=mock2, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, oversample=1, gain=-45.0,
+        )
+
+        pos = torch.zeros(50, 3)
+        n_ph = torch.full((50,), 200)
+        t = torch.zeros(50)
+
+        r1 = OpticalSimulator(config1).simulate(pos, n_ph, t, stitched=False)
+        r2 = OpticalSimulator(config2).simulate(pos, n_ph, t, stitched=False)
+
+        assert torch.allclose(r1.adc, r2.adc, atol=1e-6)
+        assert r1.t0 == r2.t0
+        assert r1.tick_ns == r2.tick_ns
+
+
+# ---------------------------------------------------------------------------
+# SER amplitude jitter tests
+# ---------------------------------------------------------------------------
+
+class TestSERJitter:
+    def test_no_jitter_unchanged(self):
+        """ser_jitter_std=0.0 produces identical results to default."""
+        mock1 = _SeededMockTOF(n_channels=4)
+        mock2 = _SeededMockTOF(n_channels=4)
+        kernel = RLCKernel(duration_ns=500.0, tick_ns=1.0, device=DEVICE)
+        pos = torch.zeros(50, 3)
+        n_ph = torch.full((50,), 200)
+        t = torch.zeros(50)
+
+        r1 = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=mock1, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, gain=-45.0,
+        )).simulate(pos, n_ph, t, stitched=False)
+        r2 = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=mock2, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, gain=-45.0, ser_jitter_std=0.0,
+        )).simulate(pos, n_ph, t, stitched=False)
+
+        assert torch.allclose(r1.adc, r2.adc, atol=1e-6)
+
+    def test_jitter_weights_not_integer(self):
+        """With jitter, histogram bins are no longer exact integers."""
+        torch.manual_seed(42)
+        times = torch.rand(500) * 200.0
+        channels = torch.randint(0, 2, (500,))
+        weights = torch.normal(1.0, 0.1, (500,))
+        wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=2, weights=weights)
+        # at least some bins should have non-integer values
+        fractional = (wf.adc - wf.adc.round()).abs()
+        assert fractional.max().item() > 0.01
+
+    def test_jitter_mean_unbiased(self):
+        """Total photon count should be approximately preserved (mean weight ~ 1)."""
+        torch.manual_seed(0)
+        times = torch.rand(100_000) * 500.0
+        channels = torch.randint(0, 2, (100_000,))
+        weights = torch.normal(1.0, 0.1, (100_000,))
+        wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=2, weights=weights)
+        total = wf.adc.sum().item()
+        assert abs(total - 100_000) / 100_000 < 0.01  # within 1%
+
+    def test_jitter_in_pipeline(self):
+        """Full pipeline with jitter runs without error."""
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=4),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=500.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-45.0,
+            ser_jitter_std=0.1,
+        ))
+        result = sim.simulate(
+            torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
+            stitched=True,
+        )
+        assert isinstance(result, SlicedWaveform)
+
+    def test_jitter_sliced_weights_match(self):
+        """Jittered SlicedWaveform photon counts match jittered Waveform."""
+        torch.manual_seed(99)
+        times = torch.rand(1000) * 200.0
+        channels = torch.randint(0, 2, (1000,))
+        weights = torch.normal(1.0, 0.1, (1000,))
+
+        wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=2, weights=weights)
+        sw = SlicedWaveform.from_photons(
+            times, channels, tick_ns=1.0, n_channels=2,
+            kernel_extent_ns=470.0, weights=weights,
+        )
+        for ch in range(2):
+            expected = wf.adc[ch].sum().item()
+            ch_mask = sw.pmt_id == ch
+            actual = sum(sw.chunk(k).sum().item() for k in torch.where(ch_mask)[0])
+            assert abs(expected - actual) < 1e-3, f"ch {ch}: count mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Baseline noise tests
+# ---------------------------------------------------------------------------
+
+class TestBaselineNoise:
+    def test_no_noise_unchanged(self):
+        """baseline_noise_std=0.0 produces identical results to default."""
+        mock1 = _SeededMockTOF(n_channels=4)
+        mock2 = _SeededMockTOF(n_channels=4)
+        kernel = RLCKernel(duration_ns=500.0, tick_ns=1.0, device=DEVICE)
+        pos = torch.zeros(50, 3)
+        n_ph = torch.full((50,), 200)
+        t = torch.zeros(50)
+
+        r1 = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=mock1, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, gain=-45.0,
+        )).simulate(pos, n_ph, t, stitched=False)
+        r2 = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=mock2, delays=Delays([]), kernel=kernel,
+            device="cpu", tick_ns=1.0, gain=-45.0, baseline_noise_std=0.0,
+        )).simulate(pos, n_ph, t, stitched=False)
+
+        assert torch.allclose(r1.adc, r2.adc, atol=1e-6)
+
+    def test_noise_std_correct(self):
+        """Noise added to a zero-signal waveform should have the configured std."""
+        torch.manual_seed(0)
+        # use a mock that returns no photons → waveform is all zeros before noise
+        mock = MockTOFSampler(n_channels=4)
+        mock.sample = lambda pos, n_ph, t_step: (
+            torch.zeros(0, device=DEVICE),
+            torch.zeros(0, device=DEVICE, dtype=torch.long),
+        )
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=mock, delays=Delays([]),
+            kernel=RLCKernel(duration_ns=100.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-1.0,
+            baseline_noise_std=2.6,
+        ))
+        result = sim.simulate(
+            torch.zeros(1, 3), torch.zeros(1, dtype=torch.int32), torch.zeros(1),
+            stitched=False,
+        )
+        # convolution of empty histogram is ~zero, noise dominates
+        measured_std = result.adc.std().item()
+        assert abs(measured_std - 2.6) < 0.5, f"measured std {measured_std:.2f}, expected ~2.6"
+
+    def test_noise_in_pipeline_with_digitize(self):
+        """Baseline noise + digitization pipeline runs correctly."""
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=4),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=500.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-20.0,
+            baseline_noise_std=2.6,
+            digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
+        ))
+        result = sim.simulate(
+            torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
+            stitched=False,
+        )
+        assert isinstance(result, Waveform)
+        assert torch.equal(result.adc, result.adc.round())
+        assert result.adc.min().item() >= 0
+        assert result.adc.max().item() <= 16383
+
+    def test_noise_sliced(self):
+        """Baseline noise works with stitched output."""
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=4),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=500.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-20.0,
+            baseline_noise_std=2.6,
+        ))
+        result = sim.simulate(
+            torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
+            stitched=True,
+        )
+        assert isinstance(result, SlicedWaveform)

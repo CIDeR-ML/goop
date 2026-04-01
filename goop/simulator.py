@@ -32,21 +32,30 @@ class OpticalSimConfig:
 
     device: str = "cuda"
     tick_ns: float = 1.0
+    oversample: int = 1
     gain: float = -45.0    # per PMT gain in ADC units
+    ser_jitter_std: float = 0.0      # std of multiplicative Gaussian on PE weights
+    baseline_noise_std: float = 0.0  # std of per-sample Gaussian ADC noise
 
     def __post_init__(self):
+        if not isinstance(self.oversample, int) or self.oversample < 1:
+            raise ValueError(f"oversample must be an int >= 1, got {self.oversample}")
         self.n_channels = self.tof_sampler.n_channels
         if isinstance(self.delays, list):
             self.delays = Delays(self.delays)
-    
+
 
 class OpticalSimulator:
     """Full optical TPC simulation pipeline."""
 
-
     def __init__(self, config: OpticalSimConfig):
         self.config = config
         self._device = torch.device(config.device)
+        if config.oversample > 1:
+            fine_tick = config.tick_ns / config.oversample
+            self._fine_kernel = config.kernel.with_tick_ns(fine_tick)
+        else:
+            self._fine_kernel = config.kernel
 
     @torch.no_grad()
     def simulate(
@@ -93,18 +102,43 @@ class OpticalSimulator:
                     times = torch.cat([times, aux_times])
                     channels = torch.cat([channels, aux_channels])
 
-        # 4. Build histograms
+        # 4. Build histograms (at fine resolution when oversampling)
+        fine_tick = cfg.tick_ns / cfg.oversample
+        fine_kernel_tensor = self._fine_kernel()
         extra_args = {}
         wvfm_cls = SlicedWaveform if stitched else Waveform
         if stitched:
-            extra_args["kernel_extent_ns"] = cfg.kernel().shape[0] * cfg.tick_ns
+            extra_args["kernel_extent_ns"] = fine_kernel_tensor.shape[0] * fine_tick
+        if cfg.oversample > 1:
+            extra_args["t0_snap_ns"] = cfg.tick_ns
 
-        wf = wvfm_cls.from_photons(times, channels, cfg.tick_ns, cfg.n_channels, **extra_args)
+        # SER amplitude jitter: per-photon multiplicative weights
+        if cfg.ser_jitter_std > 0 and times.numel() > 0:
+            extra_args["weights"] = torch.normal(
+                1.0, cfg.ser_jitter_std, (times.shape[0],), device=device
+            )
+
+        # PE counts per channel (before convolution destroys them)
+        if times.numel() > 0:
+            pe_counts = torch.bincount(channels.long(), minlength=cfg.n_channels)
+        else:
+            pe_counts = torch.zeros(cfg.n_channels, device=device, dtype=torch.long)
+
+        wf = wvfm_cls.from_photons(times, channels, fine_tick, cfg.n_channels, **extra_args)
+        wf.attrs["pe_counts"] = pe_counts
 
         # 5. Convolve
-        wf = wf.convolve(cfg.kernel(), cfg.gain)
+        wf = wf.convolve(fine_kernel_tensor, cfg.gain)
 
-        # 6. Digitize (optional)
+        # 6. Downsample to output resolution
+        if cfg.oversample > 1:
+            wf = wf.downsample(cfg.oversample)
+
+        # 7. Baseline noise (per-sample Gaussian, pre-digitization)
+        if cfg.baseline_noise_std > 0:
+            wf.adc += torch.randn_like(wf.adc) * cfg.baseline_noise_std
+
+        # 8. Digitize (optional)
         if cfg.digitization is not None:
             wf = wf.digitize(cfg.digitization.pedestal, cfg.digitization.n_bits)
 
