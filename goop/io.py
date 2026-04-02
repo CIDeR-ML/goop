@@ -132,6 +132,7 @@ def load_event_light(
     cfg = f["config"].attrs
     tick_ns = float(cfg["tick_ns"])
     n_channels = int(cfg["n_channels"])
+    pedestal = float(cfg["pedestal"]) if cfg.get("digitized", False) else 0.0
 
     evt = f[event_key]
 
@@ -150,7 +151,7 @@ def load_event_light(
         pmt_id = torch.tensor(g["pmt_id"][:], dtype=torch.long, device=device)
 
         label_val = int(lk.split("_", 1)[1])
-        attrs: dict = {"label": label_val}
+        attrs: dict = {"label": label_val, "pedestal": pedestal}
         if "pe_counts" in g:
             attrs["pe_counts"] = torch.tensor(g["pe_counts"][:], dtype=torch.long, device=device)
 

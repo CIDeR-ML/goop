@@ -105,6 +105,7 @@ class OpticalSimulator:
             wf.adc += torch.randn_like(wf.adc) * cfg.baseline_noise_std
         if cfg.digitization is not None:
             wf = wf.digitize(cfg.digitization.pedestal, cfg.digitization.n_bits)
+            wf.attrs["pedestal"] = cfg.digitization.pedestal
 
         return wf
 
@@ -150,6 +151,51 @@ class OpticalSimulator:
             results.append(sub)
         return results
 
+    def _simulate_labeled_batch(
+        self,
+        times: torch.Tensor,
+        channels: torch.Tensor,
+        photon_labels: torch.Tensor,
+        batch_labels: torch.Tensor,
+        stitched: bool,
+        add_baseline_noise: bool,
+    ) -> List[SlicedWaveform]:
+        """Run the virtual-channel pipeline for a batch of labels."""
+        cfg = self.config
+        device = self._device
+        n_ch = cfg.n_channels
+        n_batch = len(batch_labels)
+
+        # Select photons belonging to this batch
+        batch_mask = torch.isin(photon_labels, batch_labels)
+        b_times = times[batch_mask]
+        b_channels = channels[batch_mask]
+        b_photon_labels = photon_labels[batch_mask]
+
+        # Remap to contiguous virtual channels for this batch
+        label_idx = torch.searchsorted(batch_labels, b_photon_labels)
+        virtual_channels = label_idx * n_ch + b_channels
+
+        # Per-label aux sources in virtual channel space
+        if cfg.aux_photon_sources and b_times.numel() > 0:
+            for li in range(n_batch):
+                lbl_mask = b_photon_labels == batch_labels[li]
+                lbl_t = b_times[lbl_mask]
+                if lbl_t.numel() == 0:
+                    continue
+                t_start, t_end = lbl_t.min().item(), lbl_t.max().item()
+                for source in cfg.aux_photon_sources:
+                    aux_t, aux_ch = source.sample(n_ch, t_start, t_end, device)
+                    if aux_t.numel() > 0:
+                        b_times = torch.cat([b_times, aux_t])
+                        virtual_channels = torch.cat([virtual_channels, li * n_ch + aux_ch])
+
+        combined = self._simulate(
+            b_times, virtual_channels, stitched,
+            n_channels=n_ch * n_batch, add_baseline_noise=add_baseline_noise,
+        )
+        return self._split_by_label(combined, n_ch, batch_labels)
+
     @torch.no_grad()
     def simulate(
         self,
@@ -160,6 +206,7 @@ class OpticalSimulator:
         stitched: bool = True,
         subtract_t0: bool = False,
         add_baseline_noise: bool = True,
+        label_batch_size: Optional[int] = None,
     ) -> Union[SlicedWaveform, Waveform, List[SlicedWaveform]]:
         """
         Run the full optical simulation pipeline.
@@ -172,6 +219,11 @@ class OpticalSimulator:
             channel spaces (one per label) so the entire pipeline runs in
             a single batched call.  The combined waveform is then split
             back into per-label ``SlicedWaveform`` objects.
+        label_batch_size : optional int
+            Maximum number of unique labels to process in one virtual-channel
+            batch.  When the number of unique labels exceeds this, they are
+            processed in groups to limit GPU memory.  TOF sampling and delays
+            are still computed once for all labels.
 
         Returns
         -------
@@ -201,33 +253,21 @@ class OpticalSimulator:
         if times.numel() > 0:
             times = times + cfg.delays.sample(times.shape[0], device)
 
-        # Labeled mode: virtual-channel batching
+        # Labeled mode
         if labels is not None:
-            n_ch = cfg.n_channels
             photon_labels = labels[source_idx] if times.numel() > 0 else torch.empty(0, dtype=torch.long, device=device)
             unique_labels = torch.unique(labels)
             n_labels = len(unique_labels)
+            bs = label_batch_size or n_labels
 
-            # Remap to virtual channels: label_idx * n_ch + channel
-            label_idx = torch.searchsorted(unique_labels, photon_labels)
-            virtual_channels = label_idx * n_ch + channels
-
-            # Per-label aux sources in virtual channel space
-            if cfg.aux_photon_sources and times.numel() > 0:
-                for li in range(n_labels):
-                    lbl_mask = photon_labels == unique_labels[li]
-                    lbl_t = times[lbl_mask]
-                    if lbl_t.numel() == 0:
-                        continue
-                    t_start, t_end = lbl_t.min().item(), lbl_t.max().item()
-                    for source in cfg.aux_photon_sources:
-                        aux_t, aux_ch = source.sample(n_ch, t_start, t_end, device)
-                        if aux_t.numel() > 0:
-                            times = torch.cat([times, aux_t])
-                            virtual_channels = torch.cat([virtual_channels, li * n_ch + aux_ch])
-
-            combined = self._simulate(times, virtual_channels, stitched, n_channels=n_ch * n_labels, add_baseline_noise=add_baseline_noise)
-            return self._split_by_label(combined, n_ch, unique_labels)
+            results: List[SlicedWaveform] = []
+            for start in range(0, n_labels, bs):
+                batch_labels = unique_labels[start:start + bs]
+                results.extend(self._simulate_labeled_batch(
+                    times, channels, photon_labels, batch_labels,
+                    stitched, add_baseline_noise,
+                ))
+            return results
 
         # Unlabeled mode
         if cfg.aux_photon_sources and times.numel() > 0:

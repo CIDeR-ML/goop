@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -271,11 +271,21 @@ class SlicedWaveform:
             n_channels=n_channels,
         )
 
-    def deslice(self) -> Waveform:
-        """Decompress all channels back to a shared global time axis."""
+    def deslice(self, fill: Optional[float] = None) -> Waveform:
+        """Decompress all channels back to a shared global time axis.
+
+        Parameters
+        ----------
+        fill : float, optional
+            Value for dead (non-active) regions.  Defaults to
+            ``attrs["pedestal"]`` if present, otherwise ``0.0``.
+        """
+        if fill is None:
+            fill = float(self.attrs.get("pedestal", 0.0))
+
         if self.n_chunks == 0:
             return Waveform(
-                adc=torch.zeros(self.n_channels, 1, device=self.adc.device),
+                adc=torch.full((self.n_channels, 1), fill, device=self.adc.device),
                 t0=0.0, tick_ns=self.tick_ns, n_channels=self.n_channels,
                 attrs=dict(self.attrs),
             )
@@ -293,7 +303,7 @@ class SlicedWaveform:
             n_bins = max(1, int((global_t_end - global_t0) / self.tick_ns))
 
         device = self.adc.device
-        data = torch.zeros(self.n_channels, n_bins, device=device, dtype=torch.float32)
+        data = torch.full((self.n_channels, n_bins), fill, device=device, dtype=torch.float32)
 
         for k in range(self.n_chunks):
             ch = int(self.pmt_id[k].item())
@@ -309,8 +319,18 @@ class SlicedWaveform:
             attrs=dict(self.attrs),
         )
 
-    def deslice_channel(self, channel: int) -> Tuple[float, torch.Tensor]:
-        """Decompress one channel. Returns (t0_ns, 1D waveform tensor)."""
+    def deslice_channel(self, channel: int, fill: Optional[float] = None) -> Tuple[float, torch.Tensor]:
+        """Decompress one channel. Returns (t0_ns, 1D waveform tensor).
+
+        Parameters
+        ----------
+        fill : float, optional
+            Value for dead regions.  Defaults to ``attrs["pedestal"]``
+            if present, otherwise ``0.0``.
+        """
+        if fill is None:
+            fill = float(self.attrs.get("pedestal", 0.0))
+
         if channel >= self.n_channels:
             raise IndexError(
                 f"channel {channel} out of range for {self.n_channels} channels"
@@ -319,7 +339,7 @@ class SlicedWaveform:
         ch_indices = torch.where(self.pmt_id == channel)[0]
 
         if ch_indices.numel() == 0:
-            return 0.0, torch.zeros(1, device=self.adc.device, dtype=self.adc.dtype)
+            return 0.0, torch.full((1,), fill, device=self.adc.device, dtype=self.adc.dtype)
 
         ch_t0 = float('inf')
         ch_t_end = float('-inf')
@@ -332,7 +352,7 @@ class SlicedWaveform:
             ch_t_end = max(ch_t_end, t_end)
 
         n_real = max(1, int((ch_t_end - ch_t0) / self.tick_ns))
-        real_wf = torch.zeros(n_real, device=self.adc.device, dtype=self.adc.dtype)
+        real_wf = torch.full((n_real,), fill, device=self.adc.device, dtype=self.adc.dtype)
 
         for idx in ch_indices:
             k = idx.item()
