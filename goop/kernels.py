@@ -88,7 +88,7 @@ class SERKernel(ConvolutionKernelBase):
     tau_o_ns: float = 651.44
     duration_ns: float = 6000.0
     tick_ns: float = 1.0
-    kernel_adc_peak: float = -25.0  # just based on figure 4 of https://arxiv.org/pdf/2406.07514
+    kernel_adc_peak: float = -25.0  # based on figure 4 of https://arxiv.org/pdf/2406.07514 (SBND simulation)
     device: torch.device = torch.device("cpu")
 
     _kernel_cache: torch.Tensor = field(default=None, init=False, repr=False)

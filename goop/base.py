@@ -17,7 +17,7 @@ class TOFSamplerBase(ABC):
         pos: torch.Tensor,
         n_photons: torch.Tensor,
         t_step: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample photon arrival times and channel IDs.
 
         Parameters
@@ -30,6 +30,8 @@ class TOFSamplerBase(ABC):
         -------
         times : (M,) detected photon arrival times in ns.
         channels : (M,) PMT channel IDs.
+        source_idx : (M,) index into *pos* identifying which input position
+            produced each photon.
         """
         ...
 

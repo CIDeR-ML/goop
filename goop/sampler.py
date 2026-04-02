@@ -272,13 +272,14 @@ class TOFSampler(TOFSamplerBase):
         return out_flat.reshape(n_pmts_full, n_bins).to(torch.int32)  # (162, n_bins)
 
     def _sample_raw(self, pos, scale, N, P, n_pmts_full, chunk_size, t_step):
-        """Inverse-CDF sampling for raw (time, channel) pairs.
+        """Inverse-CDF sampling for raw (time, channel, source_idx) triples.
 
         Same cathode convention as _sample_histogram: x<=0 -> PMTs 0..(P-1),
         x>0 -> PMTs P..(2P-1).
         """
         all_times = []
         all_ch = []
+        all_source = []
         u_grid = self.u_grid  # (Q,) uniform quantile grid
 
         for start in range(0, N, chunk_size):
@@ -305,6 +306,9 @@ class TOFSampler(TOFSamplerBase):
             active_counts = counts[active_mask]      # (M,)
             active_coeffs = coeffs[active_mask]      # (M, K)
             active_t0 = t0[active_mask]              # (M,)
+
+            # Track which input position each active pair belongs to
+            pos_local, _ = active_mask.nonzero(as_tuple=True)  # (M,) position index within chunk
 
             # assign full-detector PMT channel ids (0..161)
             pmt_offset = torch.where(on_pos_side, P, 0).unsqueeze(1).expand(C, P)  # (C, P)
@@ -334,14 +338,14 @@ class TOFSampler(TOFSamplerBase):
                 active_t_emit = t_expanded[active_mask]         # (M,)
                 t_samp = t_samp + active_t_emit[pair_idx]       # (T,) add emission time offset
 
-            all_times.append(t_samp)              # (T,)
-            all_ch.append(active_pmt[pair_idx])   # (T,) PMT channel per photon
+            all_times.append(t_samp)                         # (T,)
+            all_ch.append(active_pmt[pair_idx])              # (T,) PMT channel per photon
+            all_source.append(pos_local[pair_idx] + start)   # (T,) global position index per photon
 
         if all_times:
-            return torch.cat(all_times), torch.cat(all_ch)
-        return torch.zeros(0, device=self._device), torch.zeros(
-            0, device=self._device, dtype=torch.long
-        )
+            return torch.cat(all_times), torch.cat(all_ch), torch.cat(all_source)
+        empty = torch.zeros(0, device=self._device)
+        return empty, empty.long(), empty.long()
 
     def close(self):
         if self._file is not None:

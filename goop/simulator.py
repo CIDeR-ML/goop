@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -57,19 +57,126 @@ class OpticalSimulator:
         else:
             self._fine_kernel = config.kernel
 
+    def _simulate(
+        self,
+        times: torch.Tensor,
+        channels: torch.Tensor,
+        stitched: bool,
+        *,
+        n_channels: Optional[int] = None,
+        add_baseline_noise: bool = True,
+    ) -> Union[SlicedWaveform, Waveform]:
+        """Histogram → SER jitter → convolve → downsample → noise → digitize.
+
+        Aux photon sources must be injected into *times*/*channels* by the
+        caller before this method is called.
+        """
+        cfg = self.config
+        device = self._device
+        fine_tick = self._fine_tick
+        fine_kernel_tensor = self._fine_kernel()
+        if n_channels is None:
+            n_channels = cfg.n_channels
+
+        wvfm_cls = SlicedWaveform if stitched else Waveform
+        extra_args: dict = {}
+        if stitched:
+            extra_args["kernel_extent_ns"] = fine_kernel_tensor.shape[0] * fine_tick
+        if cfg.oversample > 1:
+            extra_args["t0_snap_ns"] = cfg.tick_ns
+        if cfg.ser_jitter_std > 0 and times.numel() > 0:
+            extra_args["weights"] = torch.normal(
+                1.0, cfg.ser_jitter_std, (times.shape[0],), device=device
+            )
+
+        if times.numel() > 0:
+            pe_counts = torch.bincount(channels.long(), minlength=n_channels)
+        else:
+            pe_counts = torch.zeros(n_channels, device=device, dtype=torch.long)
+
+        wf = wvfm_cls.from_photons(times, channels, fine_tick, n_channels, **extra_args)
+        wf.attrs["pe_counts"] = pe_counts
+
+        wf = wf.convolve(fine_kernel_tensor, cfg.gain)
+        if cfg.oversample > 1:
+            wf = wf.downsample(cfg.oversample)
+
+        if add_baseline_noise and cfg.baseline_noise_std > 0:
+            wf.adc += torch.randn_like(wf.adc) * cfg.baseline_noise_std
+        if cfg.digitization is not None:
+            wf = wf.digitize(cfg.digitization.pedestal, cfg.digitization.n_bits)
+
+        return wf
+
+    @staticmethod
+    def _split_by_label(
+        wf: SlicedWaveform, n_channels: int, unique_labels: torch.Tensor,
+    ) -> List[SlicedWaveform]:
+        """Split a virtual-channel SlicedWaveform into per-label waveforms."""
+        device = wf.adc.device
+        results: List[SlicedWaveform] = []
+        for li, lbl in enumerate(unique_labels):
+            ch_lo = li * n_channels
+            ch_hi = ch_lo + n_channels
+            idx = ((wf.pmt_id >= ch_lo) & (wf.pmt_id < ch_hi)).nonzero(as_tuple=True)[0]
+
+            if idx.numel() == 0:
+                sub = SlicedWaveform(
+                    adc=torch.empty(0, device=device),
+                    offsets=torch.tensor([0], device=device, dtype=torch.long),
+                    t0_ns=torch.empty(0, device=device),
+                    pmt_id=torch.empty(0, device=device, dtype=torch.long),
+                    tick_ns=wf.tick_ns, n_channels=n_channels,
+                    attrs={"pe_counts": wf.attrs["pe_counts"][ch_lo:ch_hi],
+                           "label": lbl.item()},
+                )
+            else:
+                starts = wf.offsets[idx]
+                ends = wf.offsets[idx + 1]
+                lengths = ends - starts
+                sample_indices = torch.cat([
+                    torch.arange(s, e, device=device)
+                    for s, e in zip(starts.tolist(), ends.tolist())
+                ])
+                sub = SlicedWaveform(
+                    adc=wf.adc[sample_indices],
+                    offsets=torch.cat([torch.tensor([0], device=device), lengths.cumsum(0)]),
+                    t0_ns=wf.t0_ns[idx],
+                    pmt_id=wf.pmt_id[idx] - ch_lo,
+                    tick_ns=wf.tick_ns, n_channels=n_channels,
+                    attrs={"pe_counts": wf.attrs["pe_counts"][ch_lo:ch_hi],
+                           "label": lbl.item()},
+                )
+            results.append(sub)
+        return results
+
     @torch.no_grad()
     def simulate(
         self,
         pos: ArrayLike,
         n_photons: ArrayLike,
         t_step: ArrayLike,
+        labels: Optional[ArrayLike] = None,
         stitched: bool = True,
         subtract_t0: bool = False,
-    ) -> Union[SlicedWaveform, Waveform]:
+        add_baseline_noise: bool = True,
+    ) -> Union[SlicedWaveform, Waveform, List[SlicedWaveform]]:
         """
         Run the full optical simulation pipeline.
 
-        Returns SlicedWaveform if stitched=True, Waveform if stitched=False.
+        Parameters
+        ----------
+        labels : optional (N,) integer array
+            Per-position label (e.g. volume ID, interaction ID).  When
+            provided, photon channels are remapped into disjoint virtual
+            channel spaces (one per label) so the entire pipeline runs in
+            a single batched call.  The combined waveform is then split
+            back into per-label ``SlicedWaveform`` objects.
+
+        Returns
+        -------
+        SlicedWaveform or Waveform when *labels* is None.
+        list[SlicedWaveform] when *labels* is provided.
         """
         cfg = self.config
         device = self._device
@@ -79,67 +186,56 @@ class OpticalSimulator:
             torch.from_dlpack(a) if not isinstance(a, torch.Tensor) else a
             for a in (pos, n_photons, t_step)
         )
+        if labels is not None:
+            labels = (
+                torch.from_dlpack(labels) if not isinstance(labels, torch.Tensor) else labels
+            ).to(dtype=torch.long, device=device)
 
         if subtract_t0:
             t_step = t_step - t_step.min()
 
-        # 1. Sample photon arrival times
-        times, channels = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
+        # 1. TOF sampling (batched across all positions)
+        times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
 
-        # 2. Add stochastic delay offsets
+        # 2. Stochastic delays
         if times.numel() > 0:
             times = times + cfg.delays.sample(times.shape[0], device)
 
-        # 3. Inject auxiliary photon sources (dark noise, etc.)
+        # Labeled mode: virtual-channel batching
+        if labels is not None:
+            n_ch = cfg.n_channels
+            photon_labels = labels[source_idx] if times.numel() > 0 else torch.empty(0, dtype=torch.long, device=device)
+            unique_labels = torch.unique(labels)
+            n_labels = len(unique_labels)
+
+            # Remap to virtual channels: label_idx * n_ch + channel
+            label_idx = torch.searchsorted(unique_labels, photon_labels)
+            virtual_channels = label_idx * n_ch + channels
+
+            # Per-label aux sources in virtual channel space
+            if cfg.aux_photon_sources and times.numel() > 0:
+                for li in range(n_labels):
+                    lbl_mask = photon_labels == unique_labels[li]
+                    lbl_t = times[lbl_mask]
+                    if lbl_t.numel() == 0:
+                        continue
+                    t_start, t_end = lbl_t.min().item(), lbl_t.max().item()
+                    for source in cfg.aux_photon_sources:
+                        aux_t, aux_ch = source.sample(n_ch, t_start, t_end, device)
+                        if aux_t.numel() > 0:
+                            times = torch.cat([times, aux_t])
+                            virtual_channels = torch.cat([virtual_channels, li * n_ch + aux_ch])
+
+            combined = self._simulate(times, virtual_channels, stitched, n_channels=n_ch * n_labels, add_baseline_noise=add_baseline_noise)
+            return self._split_by_label(combined, n_ch, unique_labels)
+
+        # Unlabeled mode
         if cfg.aux_photon_sources and times.numel() > 0:
-            t_start = times.min().item()
-            t_end = times.max().item()
+            t_start, t_end = times.min().item(), times.max().item()
             for source in cfg.aux_photon_sources:
-                aux_times, aux_channels = source.sample(
-                    cfg.n_channels, t_start, t_end, device
-                )
-                if aux_times.numel() > 0:
-                    times = torch.cat([times, aux_times])
-                    channels = torch.cat([channels, aux_channels])
+                aux_t, aux_ch = source.sample(cfg.n_channels, t_start, t_end, device)
+                if aux_t.numel() > 0:
+                    times = torch.cat([times, aux_t])
+                    channels = torch.cat([channels, aux_ch])
 
-        # 4. Build histograms (at fine resolution when oversampling)
-        fine_tick = self._fine_tick
-        fine_kernel_tensor = self._fine_kernel()
-        extra_args = {}
-        wvfm_cls = SlicedWaveform if stitched else Waveform
-        if stitched:
-            extra_args["kernel_extent_ns"] = fine_kernel_tensor.shape[0] * fine_tick
-        if cfg.oversample > 1:
-            extra_args["t0_snap_ns"] = cfg.tick_ns
-
-        # SER amplitude jitter: per-photon multiplicative weights
-        if cfg.ser_jitter_std > 0 and times.numel() > 0:
-            extra_args["weights"] = torch.normal(
-                1.0, cfg.ser_jitter_std, (times.shape[0],), device=device
-            )
-
-        # PE counts per channel (before convolution destroys them)
-        if times.numel() > 0:
-            pe_counts = torch.bincount(channels.long(), minlength=cfg.n_channels)
-        else:
-            pe_counts = torch.zeros(cfg.n_channels, device=device, dtype=torch.long)
-
-        wf = wvfm_cls.from_photons(times, channels, fine_tick, cfg.n_channels, **extra_args)
-        wf.attrs["pe_counts"] = pe_counts
-
-        # 5. Convolve
-        wf = wf.convolve(fine_kernel_tensor, cfg.gain)
-
-        # 6. Downsample to output resolution
-        if cfg.oversample > 1:
-            wf = wf.downsample(cfg.oversample)
-
-        # 7. Baseline noise (per-sample Gaussian, pre-digitization)
-        if cfg.baseline_noise_std > 0:
-            wf.adc += torch.randn_like(wf.adc) * cfg.baseline_noise_std
-
-        # 8. Digitize (optional)
-        if cfg.digitization is not None:
-            wf = wf.digitize(cfg.digitization.pedestal, cfg.digitization.n_bits)
-
-        return wf
+        return self._simulate(times, channels, stitched, add_baseline_noise=add_baseline_noise)

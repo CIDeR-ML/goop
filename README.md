@@ -54,6 +54,16 @@ result = sim.simulate(pos, n_photons, t_step, stitched=True)
 result.attrs["pe_counts"]  # (n_channels,) detected PE per PMT
 ```
 
+### Per-label waveforms
+
+Split output by any per-position grouping (detector volume, interaction ID, etc.). TOF sampling and delays are batched; the rest of the pipeline runs in a single call via virtual-channel remapping, then the combined waveform is split by label.
+
+```python
+labels = torch.tensor([0, 0, 0, 1, 1])  # one label per position
+waveforms = sim.simulate(pos, n_photons, t_step, labels=labels, stitched=True)
+# returns list[SlicedWaveform], one per unique label value
+```
+
 ### With digitization and dark noise
 
 ```python
@@ -110,7 +120,7 @@ Without digitization enabled, waveform values are **float32** (raw analog respon
 
 ## Saving & loading waveforms
 
-`goop.io` provides HDF5 I/O that splits waveforms by detector side (east PMTs 0–80, west PMTs 81–161).
+`goop.io` provides HDF5 I/O that saves per-volume waveforms (one `SlicedWaveform` per detector volume).
 
 ### Saving
 
@@ -122,11 +132,13 @@ config = OpticalSimConfig(...)
 sim = OpticalSimulator(config)
 
 with h5py.File("light_output.h5", "w") as f:
-    write_config_light(f, config, source_file="input.h5", n_events=100)
+    write_config_light(f, config, n_volumes=2, source_file="input.h5", n_events=100)
 
     for i in range(100):
-        wf = sim.simulate(pos, n_photons, t_step, stitched=True)
-        save_event_light(f, f"event_{i:03d}", wf,
+        waveforms = sim.simulate(pos, n_photons, t_step,
+                                 labels=volume_labels, stitched=True,
+                                 add_baseline_noise=False)  # noise-free for compression
+        save_event_light(f, f"event_{i:03d}", waveforms,
                          source_event_idx=i,
                          digitized=True,   # store adc as uint16
                          n_bits=14)        # scaleoffset for compression
@@ -138,32 +150,34 @@ with h5py.File("light_output.h5", "w") as f:
 from goop import load_event_light
 
 with h5py.File("light_output.h5", "r") as f:
-    wf = load_event_light(f, "event_000", device="cuda")
-    # returns a merged SlicedWaveform (east + west, global pmt_id 0-161)
+    wfs = load_event_light(f, "event_000", device="cuda")
+    # returns list[SlicedWaveform], one per volume
 
-    wf.attrs["pe_counts"]     # (162,) PE counts per PMT
-    wf.deslice()              # decompress to full (162, n_bins) Waveform
-    wf.deslice_channel(42)    # single PMT -> (t0, 1D tensor)
+    for wf in wfs:
+        wf.attrs["pe_counts"]     # (n_channels,) PE counts per PMT
+        wf.deslice()              # decompress to full (n_channels, n_bins) Waveform
+        wf.deslice_channel(42)    # single PMT -> (t0, 1D tensor)
 ```
 
 ### HDF5 layout
 
 ```
-/config/                     file-level metadata (tick_ns, gain, digitization, etc.)
+/config/                     file-level metadata (tick_ns, gain, n_volumes, etc.)
 /event_000/
-    attrs: source_event_idx
-    pe_counts_east  (81,) int32
-    pe_counts_west  (81,) int32
-    east/
-        adc      (N,) uint16 or float32     # gzip + scaleoffset
-        offsets  (K+1,) int64               # CSR chunk boundaries
-        t0_ns    (K,) float32               # chunk time origins
-        pmt_id   (K,) int32                 # local PMT index (0-80)
-    west/
-        (same structure, local PMT index 0-80)
+    attrs: source_event_idx, n_volumes
+    volume_0/
+        adc        (N,) uint16 or float32   # gzip + scaleoffset
+        offsets    (K+1,) int64             # CSR chunk boundaries
+        t0_ns      (K,) float32             # chunk time origins
+        pmt_id     (K,) int32               # global PMT index
+        pe_counts  (n_channels,) int32      # PE per PMT from volume 0
+    volume_1/
+        (same structure)
 ```
 
-When `digitized=True`, adc is stored as `uint16` with `scaleoffset=n_bits` for optimal compression. Otherwise stored as `float32`.
+When `digitized=True`, adc is stored as `uint16` with gzip+shuffle for optimal compression. Otherwise stored as `float32`.
+
+The TOF sampler also returns a per-photon `source_idx` mapping each detected photon back to its input position, enabling the label-based splitting described above.
 
 ## Extensibility
 
@@ -200,6 +214,14 @@ Each pipeline component is defined by an abstract base class (`base.py`), making
 | `ser_jitter_std` | 0.0 | Std of multiplicative Gaussian on per-PE weights (models dynode gain fluctuations) |
 | `baseline_noise_std` | 0.0 | Std of per-sample Gaussian ADC noise added post-convolution |
 
+**`simulate()` options**:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `labels` | None | Per-position integer labels; splits output into `list[SlicedWaveform]` via virtual-channel batching |
+| `stitched` | True | Return `SlicedWaveform` (True) or dense `Waveform` (False) |
+| `subtract_t0` | False | Shift `t_step` so the minimum is zero |
+| `add_baseline_noise` | True | Add Gaussian baseline noise; set False when saving to disk for better compression |
+
 Custom components just need to implement the relevant ABC and can be passed directly to `OpticalSimConfig`.
 
 ## Worked example
@@ -218,7 +240,7 @@ goop/
     noise.py          DarkNoise (auxiliary photon sources)
     digitize.py       DigitizationConfig, digitize (ADC quantization)
     sampler.py        TOFSampler (PCA-compressed photon library)
-    io.py             HDF5 save/load for SlicedWaveform (east/west split)
+    io.py             HDF5 save/load for per-volume SlicedWaveforms
     base.py           abstract base classes
 ```
 
