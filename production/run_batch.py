@@ -13,6 +13,7 @@ Usage (from project root):
 """
 
 import argparse
+import concurrent.futures
 import gc
 import os
 import queue
@@ -328,65 +329,79 @@ def main():
                     t.start()
                     workers.append(t)
 
+            def prefetch_load(evt_idx):
+                """Load event from HDF5 (CPU-only, no GPU work)."""
+                return load_event(args.data, cfg, event_idx=evt_idx)
+
             print(f"  {'Evt':>4} {'Segs':>8} {'Photons':>12} "
                   f"{'Labels':>6} {'PEs':>10} {'Chunks':>7} "
                   f"{'t_load':>6} {'t_light':>7} {'t_goop':>6} {'t_save':>6} {'total':>6}")
             print(f"  {'-' * 95}")
 
-            for evt_idx in range(event_start, event_end):
-                local_idx = evt_idx - event_start
-                event_key = f'event_{local_idx:03d}'
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch:
+                # Submit first load immediately
+                future = prefetch.submit(prefetch_load, event_start)
 
-                # 1. Load event
-                t0 = time.time()
-                deposits = load_event(args.data, cfg, event_idx=evt_idx)
-                t_load = time.time() - t0
+                for evt_idx in range(event_start, event_end):
+                    local_idx = evt_idx - event_start
+                    event_key = f'event_{local_idx:03d}'
 
-                # 2. jaxtpc light generation
-                t0 = time.time()
-                filled = jaxtpc_sim.process_event_light(deposits)
-                jax.block_until_ready(filled.volumes[0].charge)
-                t_light = time.time() - t0
+                    # 1. Collect prefetched deposits
+                    t0 = time.time()
+                    deposits = future.result()
+                    t_load = time.time() - t0
 
-                # 3. Extract inputs & run GOOP
-                t0 = time.time()
-                pos_mm, n_ph, t_ns, labels, total_segs = \
-                    extract_goop_inputs(filled, cfg, label_key)
-                waveforms = goop_sim.simulate(
-                    pos_mm, n_ph, t_ns,
-                    labels=labels, stitched=True, subtract_t0=False)
-                t_goop_elapsed = time.time() - t0
+                    # 2. Submit prefetch for next event
+                    if evt_idx + 1 < event_end:
+                        future = prefetch.submit(prefetch_load, evt_idx + 1)
 
-                # Collect stats before CPU transfer
-                n_labels_evt = len(waveforms)
-                total_pe = sum(
-                    wvfm.attrs['pe_counts'].sum().item() for wvfm in waveforms)
-                total_chunks = sum(wvfm.n_chunks for wvfm in waveforms)
-                total_photons = int(n_ph.sum())
+                    # 3. jaxtpc light generation (GPU — kept in main thread)
+                    t0 = time.time()
+                    filled = jaxtpc_sim.process_event_light(deposits)
+                    jax.block_until_ready(filled.volumes[0].charge)
+                    t_light = time.time() - t0
 
-                # 4. GPU → CPU transfer + save (serial or queued)
-                t0 = time.time()
-                waveforms_cpu = waveforms_to_cpu(waveforms)
-                item = (event_key, waveforms_cpu, evt_idx)
+                    # 4. Extract inputs & run GOOP
+                    t0 = time.time()
+                    pos_mm, n_ph, t_ns, labels, total_segs = \
+                        extract_goop_inputs(filled, cfg, label_key)
+                    waveforms = goop_sim.simulate(
+                        pos_mm, n_ph, t_ns,
+                        labels=labels, stitched=True, subtract_t0=False)
+                    t_goop_elapsed = time.time() - t0
 
-                if num_workers > 0:
-                    save_queue.put(item)
-                else:
-                    save_one_event(f, item)
-                t_save = time.time() - t0
+                    # Collect stats before CPU transfer
+                    n_labels_evt = len(waveforms)
+                    total_pe = sum(
+                        wvfm.attrs['pe_counts'].sum().item()
+                        for wvfm in waveforms)
+                    total_chunks = sum(wvfm.n_chunks for wvfm in waveforms)
+                    total_photons = int(n_ph.sum())
 
-                t_total = t_load + t_light + t_goop_elapsed + t_save
+                    # 4. GPU → CPU transfer + save (serial or queued)
+                    t0 = time.time()
+                    waveforms_cpu = waveforms_to_cpu(waveforms)
+                    item = (event_key, waveforms_cpu, evt_idx)
 
-                print(f"  {evt_idx:>4} {total_segs:>8,} "
-                      f"{total_photons:>12,} "
-                      f"{n_labels_evt:>6} {total_pe:>10,} {total_chunks:>7,} "
-                      f"{t_load:>5.2f}s {t_light:>6.2f}s "
-                      f"{t_goop_elapsed:>5.2f}s {t_save:>5.2f}s "
-                      f"{t_total:>5.1f}s")
+                    if num_workers > 0:
+                        save_queue.put(item)
+                    else:
+                        save_one_event(f, item)
+                    t_save = time.time() - t0
 
-                del deposits, filled, waveforms, waveforms_cpu
-                del pos_mm, n_ph, t_ns, labels
-                gc.collect()
+                    t_total = t_load + t_light + t_goop_elapsed + t_save
+
+                    print(f"  {evt_idx:>4} {total_segs:>8,} "
+                          f"{total_photons:>12,} "
+                          f"{n_labels_evt:>6} {total_pe:>10,} "
+                          f"{total_chunks:>7,} "
+                          f"{t_load:>5.2f}s {t_light:>6.2f}s "
+                          f"{t_goop_elapsed:>5.2f}s {t_save:>5.2f}s "
+                          f"{t_total:>5.1f}s")
+
+                    del deposits, filled, waveforms, waveforms_cpu
+                    del pos_mm, n_ph, t_ns, labels
+                    gc.collect()
 
             # Wait for workers to finish
             if num_workers > 0:

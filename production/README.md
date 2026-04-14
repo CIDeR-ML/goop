@@ -57,6 +57,7 @@ python3 production/run_batch.py \
 | `--total-pad` | 250,000 | Max deposits per side (jaxtpc JIT shape) |
 | `--response-chunk-size` | 50,000 | jaxtpc response chunk size |
 | `--lazy` | off | Use lazy (disk-backed) photon library loading |
+| `--workers` | 2 | Number of save worker threads (0 = serial) |
 | `--seed` | 42 | Random seed |
 
 ## Pipeline
@@ -158,21 +159,60 @@ Benchmarked on `out.h5` (MPV/MPR events, ~180K deposits/event average), 15-bit d
 | Typical interactions/event | ~15 |
 | Typical chunks | ~2,500/event |
 
+## Threading Architecture
+
+The pipeline uses three concurrent mechanisms to overlap I/O with GPU computation:
+
+```
+Prefetch thread:  read N+1 ──────── read N+2 ──────── read N+3 ────────
+Main thread:      light+GOOP N ──── light+GOOP N+1 ── light+GOOP N+2 ──
+Save workers:     save N-1 ──────── save N ─────────── save N+1 ────────
+```
+
+### 1. Prefetch thread (1 thread, not configurable)
+
+A single background thread pre-reads the next event from HDF5 via `load_event` (CPU-only: HDF5 read + numpy array construction). The result is held in a `Future` that the main thread collects at the start of the next iteration. This hides the ~0.15s HDF5 read latency behind GPU work.
+
+Only CPU work runs in this thread — all GPU work (JAX light generation, PyTorch GOOP simulation) stays in the main thread to avoid CUDA contention.
+
+### 2. Main thread (GPU)
+
+Runs all GPU computation sequentially:
+- **jaxtpc** `process_event_light` (JAX) — photon yield calculation (~0.02s)
+- **GOOP** `simulate` (PyTorch) — TOF sampling, delays, histogramming, FFT convolution (~2.3s)
+- GPU → CPU tensor transfer before queuing to save workers
+
+### 3. Save workers (`--workers N`, default 2)
+
+Background threads that pull completed events from a bounded queue and write them to HDF5. The gzip compression inside h5py releases the GIL, allowing workers to compress while the main thread simulates.
+
+- A **file lock** serializes HDF5 writes (one writer at a time)
+- Queue depth = `workers + 2` to absorb event size variation
+- Each queued item carries its own `(event_key, waveforms, source_event_idx)`, so event ordering is guaranteed regardless of which worker processes it
+- With `--workers 0`: save runs synchronously in the main thread (no threading)
+
+### Tuning `--workers`
+
+| Workers | Behavior | When to use |
+|---|---|---|
+| 0 | Serial — save blocks the main thread (~3s/event overhead) | Debugging, minimal memory |
+| 1 | Single background saver — hides most save latency | Low-memory systems |
+| 2 | Default — 2 savers overlap with GPU work | Recommended |
+| 3+ | Diminishing returns — HDF5 writes serialize through the lock | Not recommended |
+
 ## Performance
 
-Benchmarked on NVIDIA A100-SXM4-40GB with eager photon library loading, `--label-key interaction`, and `--workers 2`.
-Timing below is averaged over events 3–7 (after 3 extra warmup events beyond initial JIT warmup):
+Benchmarked on NVIDIA A100-SXM4-40GB, `--label-key interaction`, `--workers 2`, eager photon library.
+Timing averaged over events 3–7 (after 3 warmup events):
 
-| Stage | Time/event |
-|---|---|
-| Load (HDF5 read) | ~0.3s |
-| Light generation (jaxtpc) | <0.01s |
-| GOOP simulation | ~2.3s |
-| Save (queued to workers) | ~0.03s |
-| **Total (main thread)** | **~2.6s** |
+| Stage | Serial (`--workers 0`) | Threaded (`--workers 2`) |
+|---|---|---|
+| Load (HDF5 read) | ~0.15s | ~0.00s (prefetched) |
+| Light generation (jaxtpc) | ~0.02s | ~0.02s |
+| GOOP simulation | ~2.3s | ~2.3s |
+| Save (HDF5 write) | ~3.0s | ~0.04s (queued) |
+| **Total/event** | **~5.5s** | **~2.4s** |
 
 - Warmup (JIT + photon library load): ~22s one-time cost
-- GOOP simulator creation: ~12s (photon library decompression)
-- With `--workers 2`, save runs in background threads — main thread proceeds to next event immediately
-- With `--workers 0` (serial), save adds ~3s/event
-- Sim time scales with photon count: ~1.6s for small events (~180M photons), ~2.6s for large (~400M photons)
+- GOOP simulator creation: ~12–17s (photon library decompression)
+- Sim time scales with photon count: ~1.8s for small events (~180M photons), ~2.6s for large (~400M photons)
