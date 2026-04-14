@@ -1,0 +1,414 @@
+"""
+Batch optical simulation: run jaxtpc light generation + GOOP waveform production.
+
+Produces one file type per batch:
+    {dataset}_sensor_{NNNN}.h5  — per-PMT SlicedWaveform data (digitized or raw)
+
+See README.md for pipeline details, output schema, and performance benchmarks.
+
+Usage (from project root):
+    python3 production/run_batch.py --data events.h5
+    python3 production/run_batch.py --data events.h5 --dataset mpvmpr --events 100
+    python3 production/run_batch.py --data events.h5 --events 1000 --events-per-file 100
+"""
+
+import argparse
+import gc
+import os
+import queue
+import sys
+import threading
+import time
+
+# Add project root to path so goop/ is importable,
+# and jaxtpc/ so its internal `from tools.X` imports resolve
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _project_root)
+sys.path.insert(0, os.path.join(_project_root, 'jaxtpc'))
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import h5py
+import jax
+import jax.numpy as jnp
+import numpy as np
+import torch
+
+from tools.geometry import generate_detector
+from tools.simulation import DetectorSimulator
+from tools.loader import load_event
+
+from goop import OpticalSimConfig, OpticalSimulator
+from goop.kernels import SERKernel
+from goop.delays import ScintillationBiexponentialDelay, TPBTriexponentialDelay, TTSDelay
+from goop.noise import DarkNoise
+from goop.digitize import DigitizationConfig
+from goop.sampler import create_default_tof_sampler
+from goop.io import write_config_light, save_event_light
+
+sys.stdout.reconfigure(line_buffering=True)
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def get_num_events(data_path):
+    with h5py.File(data_path, 'r') as f:
+        return f['pstep/lar_vol'].shape[0]
+
+
+LABEL_FIELDS = {
+    'volume': None,           # synthetic: filled with volume index
+    'interaction': 'interaction_ids',
+    'track': 'track_ids',
+    'ancestor': 'ancestor_track_ids',
+}
+
+
+def extract_goop_inputs(filled, cfg, label_key='interaction'):
+    """Extract concatenated GOOP inputs from jaxtpc process_event_light output.
+
+    Parameters
+    ----------
+    label_key : str
+        Which field to use as the per-deposit label for GOOP.
+        One of 'volume', 'interaction', 'track', 'ancestor'.
+
+    Returns (pos_mm, n_photons, t_step_ns, labels) as JAX arrays,
+    plus total_segs count.
+    """
+    field = LABEL_FIELDS[label_key]
+    all_pos, all_nph, all_t, all_labels = [], [], [], []
+    total_segs = 0
+    for v in range(cfg.n_volumes):
+        vol = filled.volumes[v]
+        n = vol.n_actual
+        if n == 0:
+            continue
+        total_segs += n
+        all_pos.append(vol.positions_mm[:n])
+        all_nph.append(jnp.ceil(vol.photons[:n]).astype(jnp.int32))
+        all_t.append(vol.t0_us[:n] * 1000.0)  # us -> ns
+        if field is None:
+            all_labels.append(jnp.full((n,), v, dtype=jnp.int32))
+        else:
+            all_labels.append(getattr(vol, field)[:n].astype(jnp.int32))
+
+    pos_mm = jnp.concatenate(all_pos)
+    n_photons = jnp.concatenate(all_nph)
+    t_step_ns = jnp.concatenate(all_t)
+    labels = jnp.concatenate(all_labels)
+    return pos_mm, n_photons, t_step_ns, labels, total_segs
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Batch optical simulation (jaxtpc -> GOOP)')
+    # I/O
+    parser.add_argument('--data', default='out.h5', help='Input HDF5 file')
+    parser.add_argument('--config', default='jaxtpc/config/cubic_wireplane_config.yaml',
+                        help='Detector geometry YAML')
+    parser.add_argument('--dataset', default='sim',
+                        help='Dataset name prefix for output files')
+    parser.add_argument('--outdir', default='.', help='Output directory')
+    parser.add_argument('--events', type=int, default=None,
+                        help='Number of events (default: all)')
+    parser.add_argument('--events-per-file', type=int, default=1000,
+                        help='Events per output file (default: 1000)')
+    parser.add_argument('--label-key', default='interaction',
+                        choices=list(LABEL_FIELDS.keys()),
+                        help='Deposit label for per-waveform separation '
+                             '(default: interaction)')
+    # Digitization
+    parser.add_argument('--n-bits', type=int, default=15,
+                        help='ADC bit depth (default: 15)')
+    parser.add_argument('--pedestal', type=float, default=None,
+                        help='ADC pedestal (default: 0.9 * (2^n_bits - 1))')
+    parser.add_argument('--max-pe-per-pmt', type=float, default=90_000,
+                        help='PE scale for gain calculation (default: 90000)')
+    parser.add_argument('--no-digitize', action='store_true',
+                        help='Disable ADC digitization')
+    # Physics
+    parser.add_argument('--dark-noise', action='store_true',
+                        help='Enable dark noise')
+    parser.add_argument('--dark-noise-rate', type=float, default=2000.0,
+                        help='Dark noise rate in Hz (default: 2000)')
+    parser.add_argument('--baseline-noise-std', type=float, default=0.0,
+                        help='Gaussian baseline noise std (default: 0.0)')
+    parser.add_argument('--ser-jitter-std', type=float, default=0.1,
+                        help='SER jitter std (default: 0.1)')
+    # Timing / oversampling
+    parser.add_argument('--tick-ns', type=float, default=1.0,
+                        help='Output time bin width in ns (default: 1.0)')
+    parser.add_argument('--oversample', type=int, default=10,
+                        help='Internal oversampling factor (default: 10)')
+    # jaxtpc
+    parser.add_argument('--total-pad', type=int, default=250_000,
+                        help='Padding for segment arrays (default: 250000)')
+    parser.add_argument('--response-chunk-size', type=int, default=50_000,
+                        help='jaxtpc response chunk size (default: 50000)')
+    # Other
+    parser.add_argument('--lazy', action='store_true',
+                        help='Use lazy photon library loading')
+    parser.add_argument('--workers', type=int, default=2,
+                        help='Number of save worker threads (0=serial, default: 2)')
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+
+    include_digitize = not args.no_digitize
+    n_bits = args.n_bits
+    pedestal = args.pedestal if args.pedestal is not None else 0.9 * ((1 << n_bits) - 1)
+    gain = (2 ** n_bits) / args.max_pe_per_pmt
+    events_per_file = args.events_per_file
+    dataset_name = args.dataset
+    label_key = args.label_key
+
+    total_events = get_num_events(args.data)
+    num_events = min(args.events, total_events) if args.events else total_events
+    num_files = (num_events + events_per_file - 1) // events_per_file
+
+    # Output directory
+    sensor_dir = os.path.join(args.outdir, 'sensor')
+    os.makedirs(sensor_dir, exist_ok=True)
+
+    print('=' * 60)
+    print(' GOOP Batch Optical Simulation')
+    print('=' * 60)
+    print(f'  Data:           {args.data} ({num_events}/{total_events} events)')
+    print(f'  Dataset:        {dataset_name}')
+    print(f'  Label key:      {label_key}')
+    print(f'  Events/file:    {events_per_file}')
+    print(f'  Num files:      {num_files}')
+    print(f'  Digitization:   {"ON" if include_digitize else "OFF"}')
+    if include_digitize:
+        print(f'    n_bits:       {n_bits}')
+        print(f'    pedestal:     {pedestal:.0f}')
+        print(f'    gain:         {gain:.6f}')
+    print(f'  Dark noise:     {"ON" if args.dark_noise else "OFF"}'
+          + (f' ({args.dark_noise_rate} Hz)' if args.dark_noise else ''))
+    print(f'  Baseline noise: {args.baseline_noise_std}')
+    print(f'  Tick:           {args.tick_ns} ns')
+    print(f'  Oversample:     {args.oversample}x')
+    print(f'  Lazy plib:      {"ON" if args.lazy else "OFF"}')
+    print(f'  Total pad:      {args.total_pad:,}')
+    print(f'  Workers:        {args.workers} {"(serial)" if args.workers == 0 else "(threaded)"}')
+    print(f'  JAX device:     {jax.devices()[0]}')
+    print(f'  CUDA device:    {torch.cuda.get_device_name(0)}')
+    print(f'  Output:         {sensor_dir}/')
+    print()
+
+    # ---- Create jaxtpc simulator (light-only) ----
+    t_create = time.time()
+    detector_config = generate_detector(args.config)
+    jaxtpc_sim = DetectorSimulator(
+        detector_config,
+        total_pad=args.total_pad,
+        response_chunk_size=args.response_chunk_size,
+        include_track_hits=False,
+    )
+    cfg = jaxtpc_sim.config
+    t_create = time.time() - t_create
+    print(f'  jaxtpc creation:  {t_create:.1f}s')
+
+    # ---- Create GOOP simulator ----
+    t_goop = time.time()
+    goop_config = OpticalSimConfig(
+        tof_sampler=create_default_tof_sampler(lazy=args.lazy),
+        delays=[
+            ScintillationBiexponentialDelay(
+                singlet_fraction=0.3, tau_singlet_ns=6.0, tau_triplet_ns=1300.0),
+            TPBTriexponentialDelay(),
+            TTSDelay(fwhm_ns=2.4, apply_transit_time=True),
+        ],
+        tick_ns=args.tick_ns,
+        kernel=SERKernel(device=torch.device("cuda"), duration_ns=10000),
+        gain=gain,
+        oversample=args.oversample,
+        ser_jitter_std=args.ser_jitter_std,
+        baseline_noise_std=args.baseline_noise_std,
+        aux_photon_sources=(
+            [DarkNoise(rate_hz=args.dark_noise_rate)] if args.dark_noise else []),
+        digitization=(
+            DigitizationConfig(n_bits=n_bits, pedestal=pedestal)
+            if include_digitize else None),
+    )
+    goop_sim = OpticalSimulator(goop_config)
+    t_goop = time.time() - t_goop
+    print(f'  GOOP creation:    {t_goop:.1f}s')
+
+    # ---- Warmup ----
+    print('  Warmup...', end='', flush=True)
+    t_warmup = time.time()
+    warmup_dep = load_event(args.data, cfg, event_idx=0)
+    warmup_filled = jaxtpc_sim.process_event_light(warmup_dep)
+    jax.block_until_ready(warmup_filled.volumes[0].charge)
+    pos, nph, tns, lbl, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
+    warmup_wfs = goop_sim.simulate(pos, nph, tns, labels=lbl,
+                                   stitched=True, subtract_t0=False)
+    del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl
+    gc.collect()
+    torch.cuda.empty_cache()
+    t_warmup = time.time() - t_warmup
+    print(f' {t_warmup:.1f}s\n')
+
+    # ---- Save helpers ----
+    num_workers = args.workers
+    file_lock = threading.Lock()
+
+    def save_one_event(f, item):
+        """Save a single event to HDF5. Thread-safe via file_lock."""
+        event_key, waveforms_cpu, source_idx = item
+        with file_lock:
+            save_event_light(
+                f, event_key, waveforms_cpu,
+                source_event_idx=source_idx,
+                digitized=include_digitize,
+                n_bits=n_bits if include_digitize else 0)
+
+    def save_worker(f, q):
+        """Worker thread: pull items from queue, save to HDF5."""
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            save_one_event(f, item)
+            q.task_done()
+
+    def waveforms_to_cpu(waveforms):
+        """Transfer all waveform tensors to CPU, freeing GPU memory."""
+        for wf in waveforms:
+            wf.adc = wf.adc.cpu()
+            wf.offsets = wf.offsets.cpu()
+            wf.t0_ns = wf.t0_ns.cpu()
+            wf.pmt_id = wf.pmt_id.cpu()
+            pe = wf.attrs.get('pe_counts')
+            if pe is not None and isinstance(pe, torch.Tensor):
+                wf.attrs['pe_counts'] = pe.cpu()
+        return waveforms
+
+    # ---- Process events ----
+    total_start = time.time()
+
+    for file_idx in range(num_files):
+        event_start = file_idx * events_per_file
+        event_end = min(event_start + events_per_file, num_events)
+        n_in_file = event_end - event_start
+
+        sensor_path = os.path.join(
+            sensor_dir, f'{dataset_name}_sensor_{file_idx:04d}.h5')
+
+        print(f'File {file_idx:04d}: events {event_start}\u2013{event_end-1} '
+              f'({n_in_file} events)')
+
+        with h5py.File(sensor_path, 'w') as f:
+            write_config_light(
+                f, goop_config,
+                label_key=label_key,
+                n_labels=cfg.n_volumes if label_key == 'volume' else 0,
+                dataset_name=dataset_name,
+                file_index=file_idx,
+                source_file=args.data,
+                n_events=n_in_file,
+                global_event_offset=event_start,
+            )
+
+            # Start workers
+            save_queue = None
+            workers = []
+            if num_workers > 0:
+                save_queue = queue.Queue(maxsize=num_workers + 2)
+                for _ in range(num_workers):
+                    t = threading.Thread(target=save_worker,
+                                         args=(f, save_queue), daemon=True)
+                    t.start()
+                    workers.append(t)
+
+            print(f"  {'Evt':>4} {'Segs':>8} {'Photons':>12} "
+                  f"{'Labels':>6} {'PEs':>10} {'Chunks':>7} "
+                  f"{'t_load':>6} {'t_light':>7} {'t_goop':>6} {'t_save':>6} {'total':>6}")
+            print(f"  {'-' * 95}")
+
+            for evt_idx in range(event_start, event_end):
+                local_idx = evt_idx - event_start
+                event_key = f'event_{local_idx:03d}'
+
+                # 1. Load event
+                t0 = time.time()
+                deposits = load_event(args.data, cfg, event_idx=evt_idx)
+                t_load = time.time() - t0
+
+                # 2. jaxtpc light generation
+                t0 = time.time()
+                filled = jaxtpc_sim.process_event_light(deposits)
+                jax.block_until_ready(filled.volumes[0].charge)
+                t_light = time.time() - t0
+
+                # 3. Extract inputs & run GOOP
+                t0 = time.time()
+                pos_mm, n_ph, t_ns, labels, total_segs = \
+                    extract_goop_inputs(filled, cfg, label_key)
+                waveforms = goop_sim.simulate(
+                    pos_mm, n_ph, t_ns,
+                    labels=labels, stitched=True, subtract_t0=False)
+                t_goop_elapsed = time.time() - t0
+
+                # Collect stats before CPU transfer
+                n_labels_evt = len(waveforms)
+                total_pe = sum(
+                    wvfm.attrs['pe_counts'].sum().item() for wvfm in waveforms)
+                total_chunks = sum(wvfm.n_chunks for wvfm in waveforms)
+                total_photons = int(n_ph.sum())
+
+                # 4. GPU → CPU transfer + save (serial or queued)
+                t0 = time.time()
+                waveforms_cpu = waveforms_to_cpu(waveforms)
+                item = (event_key, waveforms_cpu, evt_idx)
+
+                if num_workers > 0:
+                    save_queue.put(item)
+                else:
+                    save_one_event(f, item)
+                t_save = time.time() - t0
+
+                t_total = t_load + t_light + t_goop_elapsed + t_save
+
+                print(f"  {evt_idx:>4} {total_segs:>8,} "
+                      f"{total_photons:>12,} "
+                      f"{n_labels_evt:>6} {total_pe:>10,} {total_chunks:>7,} "
+                      f"{t_load:>5.2f}s {t_light:>6.2f}s "
+                      f"{t_goop_elapsed:>5.2f}s {t_save:>5.2f}s "
+                      f"{t_total:>5.1f}s")
+
+                del deposits, filled, waveforms, waveforms_cpu
+                del pos_mm, n_ph, t_ns, labels
+                gc.collect()
+
+            # Wait for workers to finish
+            if num_workers > 0:
+                save_queue.join()
+                for _ in range(num_workers):
+                    save_queue.put(None)
+                for t in workers:
+                    t.join()
+
+        # File size
+        sensor_mb = os.path.getsize(sensor_path) / (1024 * 1024)
+        print(f'  \u2192 sensor: {sensor_mb:.1f} MB '
+              f'({sensor_mb / n_in_file * 1024:.1f} KB/event)')
+        print()
+
+    total_elapsed = time.time() - total_start
+    print(f'{"=" * 60}')
+    print(f'  Done. {num_events} events in {total_elapsed:.1f}s')
+    print(f'  Average: {total_elapsed/num_events:.2f}s/event')
+    print(f'  Files:   {num_files} in {sensor_dir}/')
+    print(f'{"=" * 60}')
+
+
+if __name__ == '__main__':
+    main()
