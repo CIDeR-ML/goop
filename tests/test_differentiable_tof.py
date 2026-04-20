@@ -302,7 +302,38 @@ class TestDiffSimIntegration:
         assert torch.isfinite(n_ph.grad).all()
         assert n_ph.grad.abs().max().item() > 0
 
-    def test_labeled_mode_rejected_with_sample_pdf(self):
+    def test_digitization_ste_grad_through_n_photons(self):
+        """With STE digitization: forward quantizes, backward still reaches n_photons."""
+        from goop import DigitizationConfig
+        sampler = _make_synth_library(cls=DifferentiableTOFSampler)
+        ser = SERKernel(duration_ns=200.0, device=DEVICE)
+        cfg = OpticalSimConfig(
+            tof_sampler=sampler, delays=Delays([]),
+            kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-1.0,
+            digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
+        )
+        sim = DifferentiableOpticalSimulator(cfg)
+
+        pos = torch.zeros(5, 3)
+        n_ph = torch.full((5,), 100.0, requires_grad=True)
+        t_step = torch.zeros(5)
+        sw = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+
+        # Forward is quantized
+        assert torch.equal(sw.adc, sw.adc.round())
+        assert sw.adc.min().item() >= 0
+        assert sw.adc.max().item() <= (1 << 14) - 1
+
+        # Backward: STE lets gradient reach n_photons even through round+clamp
+        loss = sw.adc.pow(2).sum()
+        loss.backward()
+        assert n_ph.grad is not None
+        assert torch.isfinite(n_ph.grad).all()
+        assert n_ph.grad.abs().max().item() > 0
+
+    def test_pe_counts_grad_through_n_photons(self):
+        """Loss on pe_counts (sidecar) should also backprop to n_photons."""
         sampler = _make_synth_library(cls=DifferentiableTOFSampler)
         ser = SERKernel(duration_ns=200.0, device=DEVICE)
         cfg = OpticalSimConfig(
@@ -312,29 +343,34 @@ class TestDiffSimIntegration:
         )
         sim = DifferentiableOpticalSimulator(cfg)
 
-        with pytest.raises(NotImplementedError, match="Labeled mode"):
-            sim.simulate(
-                torch.zeros(5, 3), torch.full((5,), 100), torch.zeros(5),
-                labels=torch.zeros(5, dtype=torch.long),
-                stitched=True, add_baseline_noise=False,
-            )
+        pos = torch.zeros(5, 3)
+        n_ph = torch.full((5,), 100.0, requires_grad=True)
+        t_step = torch.zeros(5)
+        sw = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        loss = sw.attrs["pe_counts"].sum()
+        loss.backward()
 
-    def test_falls_back_to_stochastic_sample(self):
-        """If the configured sampler has no sample_pdf, diff sim falls back."""
-        # Use the stochastic (parent) TOFSampler — no sample_pdf method
-        sampler = _make_synth_library(cls=TOFSampler)
-        assert not hasattr(sampler, "sample_pdf")
+        assert n_ph.grad is not None
+        assert torch.isfinite(n_ph.grad).all()
+        assert n_ph.grad.abs().max().item() > 0
 
+    def test_baseline_noise_works_with_pdf_path(self):
+        """baseline_noise_std > 0 is fine even with sample_pdf — purely additive."""
+        torch.manual_seed(0)
+        sampler = _make_synth_library(cls=DifferentiableTOFSampler)
         ser = SERKernel(duration_ns=200.0, device=DEVICE)
         cfg = OpticalSimConfig(
             tof_sampler=sampler, delays=Delays([]),
             kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
             device="cpu", tick_ns=1.0, gain=-1.0,
+            baseline_noise_std=3.0,
         )
         sim = DifferentiableOpticalSimulator(cfg)
         sw = sim.simulate(
             torch.zeros(5, 3), torch.full((5,), 100), torch.zeros(5),
-            stitched=True, add_baseline_noise=False,
+            stitched=True, add_baseline_noise=True,
         )
         from goop import SlicedWaveform
         assert isinstance(sw, SlicedWaveform)
+        # noise is on the order of baseline_noise_std
+        assert sw.adc.std().item() > 1.0

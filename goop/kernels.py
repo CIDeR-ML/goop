@@ -222,7 +222,7 @@ class TPBTriexponentialKernel(ConvolutionKernelBase):
     a_2: float = 0.3
     a_3: float = 0.08
     a_4: float = 0.02
-    duration_ns: float = 35500.0  # ≈10 × tau_3 → mass loss < 1e-4
+    duration_ns: float = 35500.0  # ~10 * tau_3 -> mass loss < 1e-4
     tick_ns: float = 1.0
     device: torch.device = torch.device("cpu")
 
@@ -253,10 +253,10 @@ class TTSKernel(ConvolutionKernelBase):
     σ = fwhm_ns / 2.35482.  Default ``transit_time_ns=55.0`` matches the
     default ``TTSDelay`` (which adds a 55 ns transit-time shift plus jitter).
 
-    The kernel time axis is non-negative, so set ``transit_time_ns`` ≳ 4σ to
-    avoid clipping the Gaussian's left tail (default 55 ns ≫ 4 × 1 ns is fine).
+    The kernel time axis is non-negative, so set ``transit_time_ns`` >= 4σ to
+    avoid clipping the Gaussian's left tail (default 55 ns >> 4 × 1 ns is fine).
     Setting ``transit_time_ns=0`` clips half the mass (matches the historical
-    ``TTSDelay(apply_transit_time=True)`` behavior, but means kernel sum ≈ 0.5).
+    ``TTSDelay(apply_transit_time=True)`` behavior, but means kernel sum ~= 0.5).
     """
 
     fwhm_ns: float = 2.4

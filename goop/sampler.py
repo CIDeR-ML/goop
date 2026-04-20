@@ -20,8 +20,6 @@ DEFAULT_N_SIMULATED = 15_000_000
 
 def create_default_tof_sampler(**kwargs) -> TOFSamplerBase:
     """Create a TOFSampler with the standard photon library."""
-    from .sampler import TOFSampler
-
     default_kwargs = {
         "n_simulated": DEFAULT_N_SIMULATED,
         "lazy": False,

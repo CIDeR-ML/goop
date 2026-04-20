@@ -8,7 +8,7 @@ from .delays import (
     TTSDelay,
     create_default_delays,
 )
-from .differentiable import DifferentiableOpticalSimulator
+from .diff_simulator import DifferentiableOpticalSimulator
 from .digitize import DigitizationConfig
 from .io import load_event_light, save_event_light, write_config_light
 from .kernels import (

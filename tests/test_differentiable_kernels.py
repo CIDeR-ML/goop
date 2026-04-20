@@ -279,7 +279,12 @@ class TestResponse:
 
 
 class _SeededTOF:
-    """Returns the same set of photons each call — isolates delay stochasticity."""
+    """Returns the same set of photons each call — isolates delay stochasticity.
+
+    Provides both ``sample()`` (stochastic interface) and ``sample_pdf()``
+    (PDF-deposition interface, returning the same photons with unit weights)
+    so the same mock can be used for both pipelines in tests.
+    """
 
     def __init__(self, n_channels=4, seed=2026):
         self._n_channels = n_channels
@@ -306,6 +311,12 @@ class _SeededTOF:
         n = times.numel()
         source_idx = torch.arange(n, device=DEVICE) % pos.shape[0]
         return times.clone(), channels.clone(), source_idx
+
+    def sample_pdf(self, pos, n_photons, t_step):
+        """PDF-deposition mock: same photons as sample(), with weight=1 each."""
+        times, channels, _ = self.sample(pos, n_photons, t_step)
+        weights = torch.ones_like(times)
+        return times, channels, weights
 
 
 def _fixed_hist(times, channels, t0, n_bins, tick, n_channels):
@@ -488,32 +499,47 @@ def _minimal_cfg(**overrides) -> OpticalSimConfig:
     return OpticalSimConfig(**base)
 
 
+class _SamplerNoPdf:
+    """A TOF sampler with sample() but no sample_pdf — for the rejection test."""
+    @property
+    def n_channels(self):
+        return 2
+    def sample(self, pos, n_photons, t_step):
+        empty = torch.zeros(0)
+        return empty, empty.long(), empty.long()
+
+
 class TestDifferentiableSimulatorAssertions:
-    def test_rejects_digitization(self):
+    def test_allows_digitization_via_ste(self):
+        """Diff sim accepts digitization; the STE bypasses round/clamp in backward."""
         from goop import DigitizationConfig
         cfg = _minimal_cfg(digitization=DigitizationConfig(n_bits=14, pedestal=1500.0))
-        with pytest.raises(ValueError, match="digitization"):
-            DifferentiableOpticalSimulator(cfg)
+        DifferentiableOpticalSimulator(cfg)  # should NOT raise
 
-    def test_rejects_ser_jitter(self):
+    def test_allows_ser_jitter(self):
+        """SER jitter composes as weights *= N(1, σ); gradient flow preserved."""
         cfg = _minimal_cfg(ser_jitter_std=0.1)
-        with pytest.raises(ValueError, match="ser_jitter_std"):
-            DifferentiableOpticalSimulator(cfg)
+        DifferentiableOpticalSimulator(cfg)  # should NOT raise
 
-    def test_rejects_baseline_noise(self):
+    def test_allows_baseline_noise(self):
+        """Baseline noise is just additive — gradient flow preserved."""
         cfg = _minimal_cfg(baseline_noise_std=2.0)
-        with pytest.raises(ValueError, match="baseline_noise_std"):
-            DifferentiableOpticalSimulator(cfg)
+        DifferentiableOpticalSimulator(cfg)  # should NOT raise
 
-    def test_rejects_aux_photon_sources(self):
+    def test_allows_aux_photon_sources(self):
+        """Dark hits are appended with unit weights; independent of input grads."""
         from goop import DarkNoise
         cfg = _minimal_cfg(aux_photon_sources=[DarkNoise(rate_hz=2000.0)])
-        with pytest.raises(ValueError, match="aux_photon_sources"):
+        DifferentiableOpticalSimulator(cfg)  # should NOT raise
+
+    def test_rejects_sampler_without_sample_pdf(self):
+        """Diff sim requires the configured TOF sampler to expose sample_pdf."""
+        cfg = _minimal_cfg(tof_sampler=_SamplerNoPdf())
+        with pytest.raises(ValueError, match="sample_pdf"):
             DifferentiableOpticalSimulator(cfg)
 
     def test_accepts_clean_config(self):
         cfg = _minimal_cfg()
-        # Should not raise
         DifferentiableOpticalSimulator(cfg)
 
     def test_rejects_stitched_false(self):
@@ -524,3 +550,54 @@ class TestDifferentiableSimulatorAssertions:
                 torch.zeros(5, 3), torch.full((5,), 100), torch.zeros(5),
                 stitched=False,
             )
+
+    def test_digitization_quantizes_output(self):
+        """With digitization on, output is integer-valued and ADC-clamped."""
+        from goop import DigitizationConfig
+        cfg = _minimal_cfg(
+            digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
+        )
+        sim = DifferentiableOpticalSimulator(cfg)
+
+        sw = sim.simulate(
+            torch.zeros(5, 3), torch.full((5,), 100.0), torch.zeros(5),
+            stitched=True, add_baseline_noise=False,
+        )
+        assert torch.equal(sw.adc, sw.adc.round())
+        assert sw.adc.min().item() >= 0
+        assert sw.adc.max().item() <= (1 << 14) - 1
+
+    def test_baseline_noise_actually_applied(self):
+        """Diff sim with baseline_noise_std > 0 should add noise to the output."""
+        torch.manual_seed(0)
+        cfg_quiet = _minimal_cfg()
+        cfg_noisy = _minimal_cfg(baseline_noise_std=5.0)
+        sim_quiet = DifferentiableOpticalSimulator(cfg_quiet)
+        sim_noisy = DifferentiableOpticalSimulator(cfg_noisy)
+
+        pos = torch.zeros(5, 3)
+        n_ph = torch.full((5,), 50)
+        t = torch.zeros(5)
+        sw_q = sim_quiet.simulate(pos, n_ph, t, stitched=True, add_baseline_noise=True)
+        sw_n = sim_noisy.simulate(pos, n_ph, t, stitched=True, add_baseline_noise=True)
+        assert sw_n.adc.std().item() > sw_q.adc.std().item(), (
+            "noisy diff sim output should have larger ADC std than quiet sim"
+        )
+
+    def test_ser_jitter_actually_applied(self):
+        """ser_jitter_std > 0 should change the histogram weights vs jitter-free."""
+        torch.manual_seed(1)
+        cfg_clean = _minimal_cfg()
+        cfg_jitter = _minimal_cfg(ser_jitter_std=0.5)
+        sim_clean = DifferentiableOpticalSimulator(cfg_clean)
+        sim_jitter = DifferentiableOpticalSimulator(cfg_jitter)
+
+        pos = torch.zeros(10, 3)
+        n_ph = torch.full((10,), 100)
+        t = torch.zeros(10)
+        sw_c = sim_clean.simulate(pos, n_ph, t, stitched=True, add_baseline_noise=False)
+        sw_j = sim_jitter.simulate(pos, n_ph, t, stitched=True, add_baseline_noise=False)
+        assert not torch.allclose(sw_c.adc, sw_j.adc, atol=1e-3), (
+            "jittered output should differ from non-jittered"
+        )
+
