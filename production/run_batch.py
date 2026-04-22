@@ -48,6 +48,7 @@ from goop.sampler import create_default_tof_sampler
 from goop.io import write_config_light, save_event_light
 from goop.interaction_align import align_interaction as align_interaction_fn
 
+
 sys.stdout.reconfigure(line_buffering=True)
 
 
