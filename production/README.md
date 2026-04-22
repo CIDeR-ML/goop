@@ -59,6 +59,7 @@ python3 production/run_batch.py \
 | `--lazy` | off | Use lazy (disk-backed) photon library loading |
 | `--workers` | 2 | Number of save worker threads (0 = serial) |
 | `--seed` | 42 | Random seed |
+| `--align_interaction` | off | Align interactions when label_key = `interaction` |
 
 ## Pipeline
 
