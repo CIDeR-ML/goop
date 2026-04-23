@@ -22,7 +22,14 @@ from .kernels import (
     create_default_response,
 )
 from .noise import DarkNoise
-from .sampler import DifferentiableTOFSampler, TOFSampler
+from .sampler import (
+    DifferentiableTOFSampler,
+    PCATOFSampler,
+    SirenTOFSampler,
+    TOFSampler,
+    create_default_tof_sampler,
+    create_siren_tof_sampler,
+)
 from .simulator import OpticalSimConfig, OpticalSimulator
 from .waveform import SlicedWaveform, Waveform
 
@@ -49,7 +56,11 @@ __all__ = [
     "create_default_response",
     "DifferentiableOpticalSimulator",
     "DifferentiableTOFSampler",
+    "PCATOFSampler",
     "TOFSampler",
+    "SirenTOFSampler",
+    "create_default_tof_sampler",
+    "create_siren_tof_sampler",
     "OpticalSimulator",
     "Waveform",
     "SlicedWaveform",
