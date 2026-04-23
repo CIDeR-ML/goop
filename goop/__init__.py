@@ -9,7 +9,7 @@ from .delays import (
     create_default_delays,
 )
 from .digitize import DigitizationConfig
-from .io import load_event_light, save_event_light, write_config_light
+from .io import load_event_light, save_event_light, write_config_light, save_event_light_w_tpc, load_event_light_w_tpc
 from .kernels import RLCKernel, SERKernel
 from .noise import DarkNoise
 from .sampler import TOFSampler
