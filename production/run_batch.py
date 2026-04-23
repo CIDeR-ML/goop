@@ -46,7 +46,7 @@ from goop.noise import DarkNoise
 from goop.digitize import DigitizationConfig
 from goop.sampler import create_default_tof_sampler
 from goop.io import write_config_light, save_event_light
-from goop.interaction_align import align_interaction as align_interaction_fn
+# from goop.waveform_utils import align as align_fn
 
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -161,7 +161,7 @@ def main():
     parser.add_argument('--workers', type=int, default=2,
                         help='Number of save worker threads (0=serial, default: 2)')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--align_interaction', action='store_true', help='Requires subtract_t0=True in goop_sim.simulate()')
+    parser.add_argument('--align', action='store_true', help='Requires subtract_t0=True in goop_sim.simulate()')
     args = parser.parse_args()
 
     include_digitize = not args.no_digitize
@@ -171,7 +171,7 @@ def main():
     events_per_file = args.events_per_file
     dataset_name = args.dataset
     label_key = args.label_key
-    should_align = (args.label_key == 'interaction') and args.align_interaction
+    should_align = args.align
 
     total_events = get_num_events(args.data)
     num_events = min(args.events, total_events) if args.events else total_events
@@ -375,7 +375,7 @@ def main():
 
                     # 4.1 - Align Waveforms
                     if should_align:
-                        waveforms = [align_interaction_fn(wf) for wf in waveforms] # List[SlicedWaveform]
+                        waveforms = [wf.align() for wf in waveforms] # List[SlicedWaveform]
                     
                     t_goop_elapsed = time.time() - t0
 
