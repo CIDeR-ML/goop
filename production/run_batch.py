@@ -46,7 +46,6 @@ from goop.noise import DarkNoise
 from goop.digitize import DigitizationConfig
 from goop.sampler import create_default_tof_sampler
 from goop.io import write_config_light, save_event_light
-# from goop.waveform_utils import align as align_fn
 
 
 sys.stdout.reconfigure(line_buffering=True)
