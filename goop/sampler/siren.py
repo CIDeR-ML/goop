@@ -72,7 +72,7 @@ class SirenTOFSampler(PCATOFSampler):
     ):
         dev = torch.device(device) if isinstance(device, str) else device
 
-        # ---- 1. shared PCA basis + voxel metadata + PMT positions ----------
+        # 1. shared PCA basis + voxel metadata + PMT positions
         basis = PCATOFSampler._read_h5_basis(plib_path)
         if basis["mode"] != "log_quantile":
             raise ValueError(
@@ -98,7 +98,7 @@ class SirenTOFSampler(PCATOFSampler):
             max_xyz=basis["max_xyz"],
         )
 
-        # ---- 2. sirentv imports + network ---------------------------------
+        # 2. sirentv imports + network
         if sirentv_src and sirentv_src not in sys.path:
             sys.path.insert(0, sirentv_src)
         from sirentv.models.pca_siren import PcaSiren  # noqa: E402
@@ -136,26 +136,22 @@ class SirenTOFSampler(PCATOFSampler):
             p.requires_grad_(False)
         self.net = net
 
-        # ---- 3. visibility inverse transform + n_photon -------------------
+        # 3. visibility inverse transform + n_photon
         _, inv_xform_vis = partial_xform_vis(cfg.get("transform_vis", {}))
         self._inv_xform_vis = inv_xform_vis
         if n_photon is None:
             n_photon = cfg.get("compressed_plib", {}).get("n_photon", 1.5e7)
         self._n_photon = float(n_photon)
 
-        # ---- 4. cached normalized PMT positions ---------------------------
+        # 4. cached normalized PMT positions
         pmt_pos_t = torch.from_numpy(basis["pmt_pos"].astype(np.float32)).to(self._device)
         self._norm_pmt_pos = self._normalize_coord(pmt_pos_t)  # (P, 3) in [-1, 1]
-
-    # ---- helpers ---------------------------------------------------------
 
     def _normalize_coord(self, pos: torch.Tensor) -> torch.Tensor:
         """Map world-mm coordinates to [-1, 1] per axis (matches VoxelMeta.norm_coord)."""
         lo = self._min_xyz.to(dtype=pos.dtype, device=pos.device)
         hi = self._max_xyz.to(dtype=pos.dtype, device=pos.device)
         return 2.0 * (pos - lo) / (hi - lo) - 1.0
-
-    # ---- _lookup ---------------------------------------------------------
 
     def _lookup(self, pos: torch.Tensor):
         """pos: (N, 3) on the x<=0 half-detector -> (vis, t0, coeffs).

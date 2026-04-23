@@ -141,7 +141,7 @@ class TOFSampler(PCATOFSampler):
         inst.coeffs = coeffs.to(dtype=torch.float32, device=dev)
         return inst
 
-    # ---- LUT fetch (trilinear or nearest-neighbor) -----------------------
+    # LUT fetch (trilinear or nearest-neighbor)
 
     def _coord_to_voxel(self, pos):
         """pos: (N, 3) -> (N,) voxel indices via flat raveled index."""

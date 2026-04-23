@@ -47,8 +47,6 @@ class PCATOFSampler(TOFSamplerBase):
     PMT ids P..(2P-1). ``n_channels == 2 * _n_pmts``.
     """
 
-    # ---- shared-init helpers ---------------------------------------------
-
     def _init_common(
         self,
         *,
@@ -108,7 +106,7 @@ class PCATOFSampler(TOFSamplerBase):
                 n_voxels=int(f["vis"].shape[0]),
             )
 
-    # ---- abstract lookup --------------------------------------------------
+    # abstract lookup
 
     @abstractmethod
     def _lookup(self, pos: torch.Tensor):
@@ -120,13 +118,11 @@ class PCATOFSampler(TOFSamplerBase):
         x-mirroring before invoking this method.
         """
 
-    # ---- shared contract --------------------------------------------------
-
     @property
     def n_channels(self) -> int:
         return self._n_pmts * 2  # full detector (both sides of cathode)
 
-    # ---- PCA reconstruction ----------------------------------------------
+    # PCA reconstruction
 
     def _quantile_times(self, coeffs, t0):
         """Reconstruct absolute quantile times from PCA coefficients.
@@ -141,8 +137,6 @@ class PCATOFSampler(TOFSamplerBase):
             q = raw.clamp_(min=0)  # (M, Q)
         q.add_(t0.unsqueeze(-1))  # (M, Q) shift relative -> absolute times
         return q
-
-    # ---- sample dispatch --------------------------------------------------
 
     @torch.no_grad()
     def sample(self, pos, n_photons, t_step, return_histogram=False,
@@ -319,8 +313,6 @@ class PCATOFSampler(TOFSamplerBase):
         empty = torch.zeros(0, device=self._device)
         return empty, empty.long(), empty.long()
 
-    # ---- differentiable PDF deposition -----------------------------------
-
     def sample_pdf(
         self,
         pos,
@@ -416,8 +408,6 @@ class PCATOFSampler(TOFSamplerBase):
             return torch.cat(all_times), torch.cat(all_ch), torch.cat(all_w)
         empty = torch.zeros(0, device=self._device)
         return empty, empty.long(), empty
-
-    # ---- lifecycle --------------------------------------------------------
 
     def close(self):
         """No-op by default; LUT subclass overrides to close its h5 handle."""
