@@ -116,6 +116,59 @@ siren = create_siren_tof_sampler(device="cuda:0")
 config = OpticalSimConfig(tof_sampler=siren, ...)
 ```
 
+### Input voxelization
+
+The diff-sim cost scales linearly with the number of input segments N. `voxelize` bins nearby segments into cubic voxels, summing photon counts and photon-weighting positions/times. Total photon yield is exactly preserved.
+
+```python
+from goop import voxelize
+
+# 10 mm voxels: reduces with no detectable waveform change
+pos_v, nph_v, tns_v = voxelize(pos_mm, n_photons, t_step_ns, dx=10.0)
+
+# Then simulate on the reduced arrays
+sw = sim.simulate(torch.from_numpy(pos_v).to(device), ...)
+```
+
+### Memory-efficient diff-sim setup
+
+By default the differentiable simulator builds the full event histogram in one pass, which can exceed GPU memory for large events (~100 k segments and up). Here are a few options you can try:
+
+1. **`autocast_dtype=torch.bfloat16`** on `create_siren_tof_sampler` — runs the SIREN network in bf16. Halves activation memory at no measurable accuracy cost.
+
+2. **`use_checkpoint=True`** on the SIREN sampler — wraps the network in `torch.utils.checkpoint`, recomputing hidden activations during backward instead of storing them. Trades ~15 % wall-time for ~6× lower SIREN-side memory.
+
+```python
+from goop import (
+    OpticalSimConfig, DifferentiableOpticalSimulator,
+    Response, SERKernel, create_siren_tof_sampler, voxelize,
+)
+from goop.delays import Delays
+
+# 1. Voxelize the raw input cloud (host-side, one-time).
+pos_v, nph_v, tns_v = voxelize(pos, n_photons, t_step, dx=20.0)
+
+# 2. SIREN sampler: bf16 + per-layer checkpoint.
+sampler = create_siren_tof_sampler(
+    device="cuda",
+    autocast_dtype=torch.bfloat16,
+    use_checkpoint=True,
+)
+
+# 3. Per-chunk checkpointing off. Streaming is on by default.
+cfg = OpticalSimConfig(
+    tof_sampler=sampler,
+    delays=Delays([]),
+    kernel=Response(kernels=[SERKernel(duration_ns=2000.0, device="cuda")],
+                    tick_ns=1.0, device="cuda"),
+    device="cuda", tick_ns=1.0, gain=-45.0,
+    stream_chunk_size=5_000, stream_checkpoint=False,
+)
+sim = DifferentiableOpticalSimulator(cfg)
+```
+
+This is the recommended setup for Adam fits on full events.
+
 ### Per-label waveforms
 
 Split output by any per-position grouping (detector volume, interaction ID, etc.). TOF sampling and delays are batched; the rest of the pipeline runs in a single call via virtual-channel remapping, then the combined waveform is split by label.
@@ -276,6 +329,9 @@ Each pipeline component is defined by an abstract base class (`base.py`), making
 | `oversample` | 1 | Internal oversampling factor; bins and convolves at `tick_ns / oversample`, then averages down |
 | `ser_jitter_std` | 0.0 | Std of multiplicative Gaussian on per-PE weights (models dynode gain fluctuations) |
 | `baseline_noise_std` | 0.0 | Std of per-sample Gaussian ADC noise added post-convolution |
+| `streaming` | True | (Diff-sim only) Time-grouped streaming histogram — peak memory scales with the largest activity burst, not the whole event. Set to `False` only for debugging / `sample_pdf` parity checks. |
+| `stream_chunk_size` | 5000 | Segments per gradient-checkpointed micro-batch inside `histogram_pdf` |
+| `stream_checkpoint` | True | Per-chunk `torch.utils.checkpoint` in the streaming path; turn off at small N (e.g. after voxelization) |
 
 **`simulate()` options**:
 | Parameter | Default | Description |
@@ -304,6 +360,7 @@ goop/
     delays.py          ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay
     noise.py           DarkNoise (auxiliary photon sources)
     digitize.py        DigitizationConfig, digitize, digitize_ste (STE for backprop)
+    utils.py           voxelize (input point-cloud coarsening)
     sampler/
         base.py        PCATOFSampler (shared PCA reconstruction + sample / sample_pdf)
         lut.py         TOFSampler, DifferentiableTOFSampler (voxel LUT lookup)

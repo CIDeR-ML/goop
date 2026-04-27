@@ -118,6 +118,16 @@ class Waveform:
             attrs=dict(self.attrs),
         )
 
+    def deslice(self, fill: Optional[float] = None) -> Waveform:
+        """No-op on a dense ``Waveform`` — returns ``self``.
+
+        Provided for interface parity with ``SlicedWaveform.deslice()`` so
+        downstream code doesn't need to care which kind of waveform the
+        simulator produced (e.g. the streaming diff-sim returns a dense
+        ``Waveform`` directly rather than a ``SlicedWaveform``).
+        """
+        return self
+
     def convolve(self, kernel: torch.Tensor, gain: float) -> Waveform:
         """FFT-convolve all channels with kernel and apply gain."""
         conv_ticks = kernel.shape[0]
@@ -214,6 +224,18 @@ class SlicedWaveform:
         all_t0: List[float] = []
         all_pmt: List[int] = []
 
+        # Default t0 for channels with no photons. Using 0.0 here pins
+        # ``deslice()``'s window to absolute-time zero whenever *any* channel is
+        # inactive, which blows n_bins up by `min(real photon t)/tick` — e.g.
+        # an interaction at t ≈ 486 μs with half the PMTs on the opposite wall
+        # turns a ~3 μs physical span into a ~488 μs dense array. Snap the
+        # earliest real photon time instead so inactive channels land at the
+        # start of the real activity window.
+        if times.numel() > 0:
+            default_t0 = float((times.min() / snap).floor() * snap)
+        else:
+            default_t0 = 0.0
+
         for ch in range(n_channels):
             ch_mask = channels == ch
             ch_times = times[ch_mask]
@@ -221,7 +243,7 @@ class SlicedWaveform:
             if ch_times.numel() == 0:
                 all_adc.append(torch.zeros(1, device=device))
                 offsets_list.append(offsets_list[-1] + 1)
-                all_t0.append(0.0)
+                all_t0.append(default_t0)
                 all_pmt.append(ch)
                 continue
 
@@ -283,35 +305,45 @@ class SlicedWaveform:
         if fill is None:
             fill = float(self.attrs.get("pedestal", 0.0))
 
+        device = self.adc.device
+
         if self.n_chunks == 0:
             return Waveform(
-                adc=torch.full((self.n_channels, 1), fill, device=self.adc.device),
+                adc=torch.full((self.n_channels, 1), fill, device=device),
                 t0=0.0, tick_ns=self.tick_ns, n_channels=self.n_channels,
                 attrs=dict(self.attrs),
             )
 
         global_t0 = self.t0_ns.min().item()
 
+        chunk_lens = self.offsets[1:] - self.offsets[:-1]             # (n_chunks,)
+        start_bins = ((self.t0_ns - global_t0) / self.tick_ns).round().long()  # (n_chunks,)
         if self.n_bins is not None:
             n_bins = self.n_bins
         else:
-            global_t_end = max(
-                self.t0_ns[k].item()
-                + int(self.offsets[k + 1] - self.offsets[k]) * self.tick_ns
-                for k in range(self.n_chunks)
-            )
-            n_bins = max(1, int((global_t_end - global_t0) / self.tick_ns))
+            n_bins = max(1, int((start_bins + chunk_lens).max().item()))
 
-        device = self.adc.device
-        data = torch.full((self.n_channels, n_bins), fill, device=device, dtype=torch.float32)
+        # Build a flat destination index for every adc element in one shot.
+        # For element i in the flat adc tensor:
+        #   chunk k = searchsorted(offsets[1:], i)
+        #   within-chunk position j = i - offsets[k]
+        #   dst = pmt_id[k] * n_bins + start_bins[k] + j
+        total = self.adc.numel()
+        flat_i = torch.arange(total, device=device, dtype=torch.long)
+        k = torch.searchsorted(self.offsets[1:].contiguous(), flat_i, side="right")
+        k = k.clamp(0, self.n_chunks - 1)
 
-        for k in range(self.n_chunks):
-            ch = int(self.pmt_id[k].item())
-            chunk_data = self.adc[self.offsets[k]:self.offsets[k + 1]]
-            r0 = int((self.t0_ns[k].item() - global_t0) / self.tick_ns)
-            chunk_len = chunk_data.numel()
-            end = min(r0 + chunk_len, n_bins)
-            data[ch, r0:end] = chunk_data[:end - r0]
+        within_chunk = flat_i - self.offsets[k]
+        dst_bin = start_bins[k] + within_chunk
+        dst_ch = self.pmt_id[k]
+        flat_dst = dst_ch * n_bins + dst_bin.clamp(0, n_bins - 1)
+
+        # Single fused scatter — differentiable (backward = gather).
+        data = torch.full(
+            (self.n_channels * n_bins,), fill, device=device, dtype=torch.float32
+        )
+        data = data.scatter(0, flat_dst, self.adc)
+        data = data.view(self.n_channels, n_bins)
 
         return Waveform(
             adc=data, t0=global_t0,
