@@ -241,10 +241,10 @@ class SlicedWaveform:
             ch_times = times[ch_mask]
 
             if ch_times.numel() == 0:
-                all_adc.append(torch.zeros(1, device=device))
-                offsets_list.append(offsets_list[-1] + 1)
-                all_t0.append(default_t0)
-                all_pmt.append(ch)
+                # all_adc.append(torch.zeros(1, device=device))
+                # offsets_list.append(offsets_list[-1] + 1)
+                # all_t0.append(default_t0)
+                # all_pmt.append(ch)
                 continue
 
             sort_idx = ch_times.sort().indices
