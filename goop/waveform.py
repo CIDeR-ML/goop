@@ -441,7 +441,7 @@ class SlicedWaveform:
             n_bins=new_n_bins,
             attrs=dict(self.attrs),
         )
-    
+
     def align(sw: SlicedWaveform, fill: float = 0.0) -> SlicedWaveform:
         """Rewrites each active channel in `sw` as a single chunk spanning the global
         [min_t0, max_t_end] window, padding gaps with `fill`. Placeholder chunks

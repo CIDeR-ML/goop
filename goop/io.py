@@ -87,12 +87,17 @@ def _write_tpc_data(
     n_photons: np.ndarray,
     t_step: np.ndarray,
     label_val: int,
+    de: np.ndarray = None,
+    pdg: np.ndarray = None,
 ) -> None:
-    """Write TPC data to *group*. Expects already-masked arrays."""
     group.create_dataset("tpc_positions", data=positions.astype(np.float32), compression="gzip")
     group.create_dataset("tpc_n_photons", data=n_photons.astype(np.int32), compression="gzip")
     group.create_dataset("tpc_t_step", data=t_step.astype(np.float32), compression="gzip")
     group.create_dataset("tpc_labels", data=np.array([label_val], dtype=np.int32), compression="gzip")
+    if de is not None:
+        group.create_dataset("tpc_de", data=de.astype(np.float32), compression="gzip")
+    if pdg is not None:
+        group.create_dataset("tpc_pdg", data=pdg.astype(np.int32), compression="gzip")
 
 def save_event_light_w_tpc(
     f: h5py.File,
@@ -102,6 +107,8 @@ def save_event_light_w_tpc(
     n_photons: np.ndarray,
     t_step: np.ndarray,
     labels: np.ndarray,
+    de: np.ndarray = None,
+    pdg: np.ndarray = None,
     source_event_idx: int = 0,
     digitized: bool = False,
     n_bits: int = 0,
@@ -123,6 +130,10 @@ def save_event_light_w_tpc(
         (N,) array of interaction time steps
     labels : np.ndarray
         (N,) array of interaction labels
+    de : np.ndarray, optional
+        (N,) array of energy deposits in MeV (dE per step, from jaxtpc).
+    pdg : np.ndarray, optional
+        (N,) array of PDG particle species codes (int32, from jaxtpc).
     """
     evt = f.create_group(event_key)
     evt.attrs["source_event_idx"] = source_event_idx
@@ -142,7 +153,12 @@ def save_event_light_w_tpc(
         _write_sliced_waveform(vol_grp, wvfm, digitized, n_bits)
         # TPC data
         mask = labels == label_val
-        _write_tpc_data(vol_grp, positions[mask], n_photons[mask], t_step[mask], label_val)
+        _write_tpc_data(
+            vol_grp,
+            positions[mask], n_photons[mask], t_step[mask], label_val,
+            de=de[mask] if de is not None else None,
+            pdg=pdg[mask] if pdg is not None else None,
+        )
 
 def save_event_light(
     f: h5py.File,
@@ -236,12 +252,23 @@ def load_event_light_w_tpc(
         ))
 
         # TPC
-        tpc_result.append({
-            "positions": torch.tensor(g["tpc_positions"][:], dtype=torch.float32, device=device),
-            "n_photons": torch.tensor(g["tpc_n_photons"][:], dtype=torch.int32, device=device),
-            "t_step":    torch.tensor(g["tpc_t_step"][:], dtype=torch.float32, device=device),
-            "label":     label_val,
-        })
+        tpc_positions = torch.tensor(g["tpc_positions"][:], dtype=torch.float32, device=device)
+        tpc_n_photons = torch.tensor(g["tpc_n_photons"][:], dtype=torch.int32, device=device)
+        tpc_t_step = torch.tensor(g["tpc_t_step"][:], dtype=torch.float32, device=device)
+        tpc_label = torch.tensor(g["tpc_labels"][:], dtype=torch.int32, device=device)
+        if "tpc_de" in g:
+            tpc_de = torch.tensor(g["tpc_de"][:], dtype=torch.float32, device=device)
+        if "tpc_pdg" in g:
+            tpc_pdg = torch.tensor(g["tpc_pdg"][:], dtype=torch.int32, device=device)
+        tpc_entry: dict = {
+            "positions": tpc_positions,
+            "n_photons": tpc_n_photons,
+            "t_step":    tpc_t_step,
+            "label":     tpc_label,
+            "de":        tpc_de if "tpc_de" in g else None,
+            "pdg":       tpc_pdg if "tpc_pdg" in g else None,
+        }
+        tpc_result.append(tpc_entry)
 
     return wf_result, tpc_result
 
