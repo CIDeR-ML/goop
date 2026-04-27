@@ -224,6 +224,18 @@ class SlicedWaveform:
         all_t0: List[float] = []
         all_pmt: List[int] = []
 
+        # Default t0 for channels with no photons. Using 0.0 here pins
+        # ``deslice()``'s window to absolute-time zero whenever *any* channel is
+        # inactive, which blows n_bins up by `min(real photon t)/tick` — e.g.
+        # an interaction at t ≈ 486 μs with half the PMTs on the opposite wall
+        # turns a ~3 μs physical span into a ~488 μs dense array. Snap the
+        # earliest real photon time instead so inactive channels land at the
+        # start of the real activity window.
+        if times.numel() > 0:
+            default_t0 = float((times.min() / snap).floor() * snap)
+        else:
+            default_t0 = 0.0
+
         for ch in range(n_channels):
             ch_mask = channels == ch
             ch_times = times[ch_mask]
