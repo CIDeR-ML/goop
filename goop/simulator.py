@@ -41,6 +41,12 @@ class OpticalSimConfig:
     n_labels_to_simulate: int = 3
     time_window_ns: Optional[float] = None
 
+    # for diff-sim
+    streaming: bool = True
+    stream_chunk_size: int = 5000
+    stream_checkpoint: bool = True    # per-chunk gradient checkpoint in histogram_pdf;
+                                       # disable for small N (e.g. after voxelization)
+
     def __post_init__(self):
         if not isinstance(self.oversample, int) or self.oversample < 1:
             raise ValueError(f"oversample must be an int >= 1, got {self.oversample}")
