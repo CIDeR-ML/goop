@@ -18,11 +18,15 @@ back through ``_lookup`` to input positions.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 
 import numpy as np
 import torch
 import yaml
+
+
+_nullctx = contextlib.nullcontext
 
 from .base import DEFAULT_N_SIMULATED, DEFAULT_PLIB_PATH, PCATOFSampler
 
@@ -69,7 +73,23 @@ class SirenTOFSampler(PCATOFSampler):
         pmt_qe: float = 0.12,
         n_photon: float | None = None,
         verbose: bool = False,
+        autocast_dtype: torch.dtype | None = None,
+        use_checkpoint: bool = False,
     ):
+        """
+        Memory-reduction knobs
+        ----------------------
+        autocast_dtype : ``torch.bfloat16`` or ``torch.float16`` to run the
+            network forward under ``torch.autocast``. Outputs are cast back to
+            fp32 before PCA reconstruction (times accumulate into absolute ns,
+            which needs fp32 precision). Roughly halves Siren activation
+            memory at a small accuracy cost.
+        use_checkpoint : if True, wrap ``self.net(inp)`` in
+            ``torch.utils.checkpoint.checkpoint`` — only the network's input
+            and output are saved for backward; the 6 hidden-layer activations
+            are recomputed on the fly. Cuts Siren-saved memory ~60× at the
+            cost of one extra forward pass during backward.
+        """
         dev = torch.device(device) if isinstance(device, str) else device
 
         # 1. shared PCA basis + voxel metadata + PMT positions
@@ -147,6 +167,10 @@ class SirenTOFSampler(PCATOFSampler):
         pmt_pos_t = torch.from_numpy(basis["pmt_pos"].astype(np.float32)).to(self._device)
         self._norm_pmt_pos = self._normalize_coord(pmt_pos_t)  # (P, 3) in [-1, 1]
 
+        # 5. memory-reduction knobs
+        self.autocast_dtype = autocast_dtype
+        self.use_checkpoint = bool(use_checkpoint)
+
     def _normalize_coord(self, pos: torch.Tensor) -> torch.Tensor:
         """Map world-mm coordinates to [-1, 1] per axis (matches VoxelMeta.norm_coord)."""
         lo = self._min_xyz.to(dtype=pos.dtype, device=pos.device)
@@ -156,8 +180,7 @@ class SirenTOFSampler(PCATOFSampler):
     def _lookup(self, pos: torch.Tensor):
         """pos: (N, 3) on the x<=0 half-detector -> (vis, t0, coeffs).
 
-        Shapes returned: vis (N, P), t0 (N, P), coeffs (N, P, K) — all float32
-        and differentiable w.r.t. ``pos``.
+        Shapes returned: vis (N, P), t0 (N, P), coeffs (N, P, K)
         """
         pos = pos.to(dtype=torch.float32, device=self._device)
         N, P = pos.shape[0], self._n_pmts
@@ -167,10 +190,37 @@ class SirenTOFSampler(PCATOFSampler):
         pmt = self._norm_pmt_pos.unsqueeze(0).expand(N, P, 3)     # (N, P, 3)
         inp = torch.cat([src, pmt], dim=-1)                       # (N, P, 6)
 
-        out = self.net(inp)  # no detach — activations carry grad to inp -> pos
-        vis = self._inv_xform_vis(out["v"]) * self._n_photon       # (N, P)
-        t0_ns = torch.exp(out["t0"])                                # (N, P)
-        coeffs = out["coeffs"]                                       # (N, P, K)
+        def _net_forward(x):
+            # Return the concatenated (v|t0|coeffs) tensor; checkpoint needs a
+            # single tensor output, not a dict.
+            d = self.net(x)
+            return torch.cat(
+                [d["v"].unsqueeze(-1), d["t0"].unsqueeze(-1), d["coeffs"]],
+                dim=-1,
+            )
+
+        autocast_ctx = (
+            torch.autocast(device_type=self._device.type, dtype=self.autocast_dtype)
+            if self.autocast_dtype is not None
+            else _nullctx()
+        )
+        with autocast_ctx:
+            if self.use_checkpoint and inp.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+                out = checkpoint(_net_forward, inp, use_reentrant=False)
+            else:
+                out = _net_forward(inp)
+
+        # Cast back to fp32: downstream PCA reconstruction and absolute-time
+        # arithmetic need fp32 precision (times can be microseconds; bf16's
+        # 7-bit mantissa gives only ~3 us resolution at 500 us).
+        out = out.float()
+        v_raw   = out[..., 0]                       # (N, P)
+        log_t0  = out[..., 1]                       # (N, P)
+        coeffs  = out[..., 2:]                      # (N, P, K)
+
+        vis   = self._inv_xform_vis(v_raw) * self._n_photon
+        t0_ns = torch.exp(log_t0)
         return vis, t0_ns, coeffs
 
 

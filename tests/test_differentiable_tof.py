@@ -374,3 +374,94 @@ class TestDiffSimIntegration:
         assert isinstance(sw, SlicedWaveform)
         # noise is on the order of baseline_noise_std
         assert sw.adc.std().item() > 1.0
+
+
+# ---------------------------------------------------------------------------
+# 6. Streaming-histogram path: same math as sample_pdf, smaller peak memory
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingHistogram:
+    """``cfg.streaming=True`` must produce the same ADC content as the default
+    ``sample_pdf`` + ``from_photons`` path on identical inputs.
+    """
+
+    def _make_cfgs(self, sampler, *, baseline_noise_std=0.0, stream_chunk_size=7):
+        """Build paired configs identical except for the ``streaming`` flag."""
+        ser = SERKernel(duration_ns=200.0, device=DEVICE)
+
+        def _build(streaming):
+            return OpticalSimConfig(
+                tof_sampler=sampler, delays=Delays([]),
+                kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
+                device="cpu", tick_ns=1.0, gain=-1.0,
+                baseline_noise_std=baseline_noise_std,
+                streaming=streaming,
+                stream_chunk_size=stream_chunk_size,
+            )
+        return _build(False), _build(True)
+
+    @staticmethod
+    def _align(adc, t0, tick_ns, t_start, n_bins):
+        """Pad ``adc`` onto the (t_start, n_bins) reference grid."""
+        import torch.nn.functional as F
+        n_ch = adc.shape[0]
+        offset = int(round((t0 - t_start) / tick_ns))
+        out = torch.zeros(n_ch, n_bins, device=adc.device, dtype=adc.dtype)
+        src_lo = max(0, -offset)
+        dst_lo = max(0, offset)
+        n_copy = min(adc.shape[1] - src_lo, n_bins - dst_lo)
+        if n_copy > 0:
+            out[:, dst_lo:dst_lo + n_copy] = adc[:, src_lo:src_lo + n_copy]
+        return out
+
+    def test_streaming_matches_sample_pdf(self):
+        """ADC output must match between ``streaming=False`` and ``streaming=True``."""
+        sampler = _make_synth_library(cls=DifferentiableTOFSampler)
+        cfg_def, cfg_str = self._make_cfgs(sampler)
+
+        sim_def = DifferentiableOpticalSimulator(cfg_def)
+        sim_str = DifferentiableOpticalSimulator(cfg_str)
+
+        torch.manual_seed(0)
+        pos = torch.linspace(-30, 30, 20).unsqueeze(-1).expand(-1, 3).contiguous()
+        n_ph = torch.full((20,), 200.0)
+        t_step = torch.linspace(0.0, 5.0, 20)
+
+        sw_def = sim_def.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        wf_def = sw_def.deslice()
+        wf_str = sim_str.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False).deslice()
+
+        # Align both onto a common time grid spanning the union.
+        tick = wf_def.tick_ns
+        assert abs(wf_str.tick_ns - tick) < 1e-9
+        t_start = min(wf_def.t0, wf_str.t0)
+        n_bins = max(
+            int(round((wf_def.t0 - t_start) / tick)) + wf_def.adc.shape[1],
+            int(round((wf_str.t0 - t_start) / tick)) + wf_str.adc.shape[1],
+        )
+        adc_def = self._align(wf_def.adc, wf_def.t0, tick, t_start, n_bins)
+        adc_str = self._align(wf_str.adc, wf_str.t0, tick, t_start, n_bins)
+
+        diff = (adc_def - adc_str).abs()
+        scale = adc_def.abs().max().clamp(min=1e-6)
+        rel_err = (diff.max() / scale).item()
+        # Should be essentially identical up to FFT/scatter float noise.
+        assert rel_err < 1e-3, f"streaming adc diverges from sample_pdf adc by rel_err={rel_err}"
+
+    def test_streaming_grad_through_n_photons(self):
+        """Backward through ``streaming=True`` reaches ``n_photons``."""
+        sampler = _make_synth_library(cls=DifferentiableTOFSampler)
+        _, cfg_str = self._make_cfgs(sampler)
+        sim = DifferentiableOpticalSimulator(cfg_str)
+
+        pos = torch.zeros(10, 3)
+        n_ph = torch.full((10,), 100.0, requires_grad=True)
+        t_step = torch.zeros(10)
+        wf = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        loss = wf.adc.pow(2).sum()
+        loss.backward()
+
+        assert n_ph.grad is not None
+        assert torch.isfinite(n_ph.grad).all()
+        assert n_ph.grad.abs().max().item() > 0

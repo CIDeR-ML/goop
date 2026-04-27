@@ -31,6 +31,7 @@ from .sampler import (
     create_siren_tof_sampler,
 )
 from .simulator import OpticalSimConfig, OpticalSimulator
+from .utils import voxelize
 from .waveform import SlicedWaveform, Waveform
 
 __all__ = [
@@ -64,6 +65,7 @@ __all__ = [
     "OpticalSimulator",
     "Waveform",
     "SlicedWaveform",
+    "voxelize",
     "write_config_light",
     "save_event_light",
     "load_event_light",
