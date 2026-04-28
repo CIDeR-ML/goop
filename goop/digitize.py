@@ -19,22 +19,27 @@ class DigitizationConfig:
     pedestal: float = 1500.0  # baseline offset in ADC counts
 
 
-def digitize(data: torch.Tensor, pedestal: float, n_bits: int) -> torch.Tensor:
+def digitize(
+    data: torch.Tensor, pedestal: float, n_bits: int, *, ste: bool = False,
+) -> torch.Tensor:
     """Add pedestal, round to integer, clamp to ADC range.
 
-    Returns float32 tensor with integer-valued entries in [0, 2^n_bits - 1].
+    Params
+    ------
+    data: torch.Tensor
+        The input data to digitize.
+    pedestal: float
+        The pedestal offset in ADC counts.
+    n_bits: int
+        The number of bits for the ADC.
+    ste: bool
+        Whether to use the straight-through estimator (to keep gradient flow)
+
+    Returns float32 tensor with integer-valued entries in ``[0, 2^n_bits - 1]``.
     """
     adc_max = (1 << n_bits) - 1
-    return (data + pedestal).round().clamp(0, adc_max)
-
-
-def digitize_ste(data: torch.Tensor, pedestal: float, n_bits: int) -> torch.Tensor:
-    """Straight-through-estimator (STE) digitization.
-
-    Forward: same as ``digitize`` — ``(data + pedestal).round().clamp(0, max)``.
-    Backward: gradient passes through to ``data`` as identity (the round and
-    clamp are bypassed in the autograd graph).
-    """
     x = data + pedestal
-    x_q = digitize(data, pedestal, n_bits)  # round + clamp, no_grad
-    return x_q + (x - x.detach())
+    x_q = x.round().clamp(0, adc_max)
+    if ste:
+        return x_q + (x - x.detach())
+    return x_q

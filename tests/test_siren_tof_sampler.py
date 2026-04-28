@@ -1,8 +1,8 @@
 """Verification for ``SirenTOFSampler``.
 
-Compares ``DifferentiableOpticalSimulator`` outputs between the default voxel-LUT
-sampler and the SIREN-backed sampler, then confirms gradients flow through the
-SIREN path all the way back to the input positions.
+Compares ``OpticalSimulator(stochastic=False)`` outputs between the default
+voxel-LUT sampler and the SIREN-backed sampler, then confirms gradients flow
+through the SIREN path all the way back to the input positions.
 
 Run: ``python test_siren_tof_sampler.py``  (under ``mamba activate py310_torch``).
 """
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from goop import (
-    DifferentiableOpticalSimulator,
+    OpticalSimulator,
     OpticalSimConfig,
     Response,
     SERKernel,
@@ -53,8 +53,8 @@ def build_simulators():
         tick_ns=1.0,
     )
     return (
-        DifferentiableOpticalSimulator(lut_cfg),
-        DifferentiableOpticalSimulator(siren_cfg),
+        OpticalSimulator(lut_cfg),
+        OpticalSimulator(siren_cfg),
     )
 
 
@@ -126,8 +126,8 @@ def check_waveform_similarity(sim_lut, sim_siren):
     t_step = torch.zeros(pos.shape[0], device=DEVICE)
 
     with torch.no_grad():
-        wf_lut = sim_lut.simulate(pos, n_ph, t_step).deslice()
-        wf_siren = sim_siren.simulate(pos, n_ph, t_step).deslice()
+        wf_lut = sim_lut.simulate(pos, n_ph, t_step, stochastic=False).deslice()
+        wf_siren = sim_siren.simulate(pos, n_ph, t_step, stochastic=False).deslice()
 
     assert wf_lut.tick_ns == wf_siren.tick_ns, (
         f"tick_ns mismatch: lut={wf_lut.tick_ns} vs siren={wf_siren.tick_ns}"
@@ -164,7 +164,7 @@ def check_gradient_flow(sim_siren):
     n_ph = torch.full((pos.shape[0],), 5e5, device=DEVICE)
     t_step = torch.zeros(pos.shape[0], device=DEVICE)
 
-    wf = sim_siren.simulate(pos, n_ph, t_step)
+    wf = sim_siren.simulate(pos, n_ph, t_step, stochastic=False)
     loss = wf.adc.float().pow(2).sum()
     loss.backward()
     assert pos.grad is not None, "pos.grad is None — autograd graph broken"

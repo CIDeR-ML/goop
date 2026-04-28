@@ -16,7 +16,6 @@ import pytest
 import torch
 
 from goop import (
-    DifferentiableOpticalSimulator,
     DifferentiableTOFSampler,
     OpticalSimConfig,
     OpticalSimulator,
@@ -110,11 +109,14 @@ class TestFromArrays:
         pos = torch.zeros(10, 3)
         n_ph = torch.full((10,), 100)
         t_step = torch.zeros(10)
-        times, channels, source_idx = s.sample(pos, n_ph, t_step=t_step)
+        times, channels, weights, source_idx = s.sample_photons(
+            pos, n_ph, t_step=t_step, return_source_idx=True,
+        )
         assert times.dim() == 1
         assert channels.dim() == 1
+        assert weights.dim() == 1
         assert source_idx.dim() == 1
-        assert times.numel() == channels.numel() == source_idx.numel()
+        assert times.numel() == channels.numel() == weights.numel() == source_idx.numel()
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +140,14 @@ class TestYieldEquivalence:
         t_step = torch.zeros(n_pos)
 
         # Diff: deterministic PDF integral per channel
-        d_times, d_channels, d_weights = diff_sampler.sample_pdf(pos, n_ph, t_step)
+        d_times, d_channels, d_weights = diff_sampler.sample_photons(pos, n_ph, t_step, stochastic=False)
         diff_per_ch = torch.zeros(diff_sampler.n_channels)
         diff_per_ch.scatter_add_(0, d_channels.long(), d_weights)
 
         # Stoch: average count per channel over n_runs
         stoch_accum = torch.zeros(stoch_sampler.n_channels)
         for _ in range(n_runs):
-            _, s_channels, _ = stoch_sampler.sample(pos, n_ph, t_step=t_step)
+            _, s_channels, _ = stoch_sampler.sample_photons(pos, n_ph, t_step=t_step)
             stoch_accum.scatter_add_(
                 0, s_channels.long(), torch.ones_like(s_channels, dtype=torch.float32)
             )
@@ -192,13 +194,13 @@ class TestHistogramEquivalence:
             out.view(-1).scatter_add_(0, flat, weights)
             return out
 
-        d_times, d_channels, d_weights = diff_sampler.sample_pdf(pos, n_ph, t_step)
+        d_times, d_channels, d_weights = diff_sampler.sample_photons(pos, n_ph, t_step, stochastic=False)
         diff_hist = hist(d_times, d_channels, d_weights)
 
         n_runs = 600
         stoch_hist = torch.zeros(n_ch, n_bins)
         for _ in range(n_runs):
-            t_s, c_s, _ = stoch_sampler.sample(pos, n_ph, t_step=t_step)
+            t_s, c_s, _ = stoch_sampler.sample_photons(pos, n_ph, t_step=t_step)
             stoch_hist += hist(t_s, c_s, torch.ones_like(t_s))
         stoch_hist /= n_runs
 
@@ -227,7 +229,7 @@ class TestGradients:
         t_step = torch.zeros(5)
         n_ph = torch.full((5,), 100.0, requires_grad=True)
 
-        times, channels, weights = sampler.sample_pdf(pos, n_ph, t_step)
+        times, channels, weights = sampler.sample_photons(pos, n_ph, t_step, stochastic=False)
         loss = weights.sum()
         loss.backward()
 
@@ -244,7 +246,7 @@ class TestGradients:
         t_step = torch.zeros(2)
         n_ph = torch.full((2,), 100.0)
 
-        _, _, weights = sampler.sample_pdf(pos, n_ph, t_step)
+        _, _, weights = sampler.sample_photons(pos, n_ph, t_step, stochastic=False)
         loss = weights.sum()
         loss.backward()
 
@@ -268,12 +270,12 @@ class TestDiffSimIntegration:
             kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
             device="cpu", tick_ns=1.0, gain=-1.0,
         )
-        sim = DifferentiableOpticalSimulator(cfg)
+        sim = OpticalSimulator(cfg)
 
         pos = torch.zeros(5, 3)
         n_ph = torch.full((5,), 100)
         t_step = torch.zeros(5)
-        sw = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        sw = sim.simulate(pos, n_ph, t_step, sliced=True, stochastic=False, add_baseline_noise=False)
 
         from goop import SlicedWaveform
         assert isinstance(sw, SlicedWaveform)
@@ -289,12 +291,12 @@ class TestDiffSimIntegration:
             kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
             device="cpu", tick_ns=1.0, gain=-1.0,
         )
-        sim = DifferentiableOpticalSimulator(cfg)
+        sim = OpticalSimulator(cfg)
 
         pos = torch.zeros(5, 3)
         n_ph = torch.full((5,), 100.0, requires_grad=True)
         t_step = torch.zeros(5)
-        sw = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        sw = sim.simulate(pos, n_ph, t_step, sliced=True, stochastic=False, add_baseline_noise=False)
         loss = sw.adc.pow(2).sum()
         loss.backward()
 
@@ -313,12 +315,12 @@ class TestDiffSimIntegration:
             device="cpu", tick_ns=1.0, gain=-1.0,
             digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
         )
-        sim = DifferentiableOpticalSimulator(cfg)
+        sim = OpticalSimulator(cfg)
 
         pos = torch.zeros(5, 3)
         n_ph = torch.full((5,), 100.0, requires_grad=True)
         t_step = torch.zeros(5)
-        sw = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        sw = sim.simulate(pos, n_ph, t_step, sliced=True, stochastic=False, add_baseline_noise=False)
 
         # Forward is quantized
         assert torch.equal(sw.adc, sw.adc.round())
@@ -341,12 +343,12 @@ class TestDiffSimIntegration:
             kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
             device="cpu", tick_ns=1.0, gain=-1.0,
         )
-        sim = DifferentiableOpticalSimulator(cfg)
+        sim = OpticalSimulator(cfg)
 
         pos = torch.zeros(5, 3)
         n_ph = torch.full((5,), 100.0, requires_grad=True)
         t_step = torch.zeros(5)
-        sw = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        sw = sim.simulate(pos, n_ph, t_step, sliced=True, stochastic=False, add_baseline_noise=False)
         loss = sw.attrs["pe_counts"].sum()
         loss.backward()
 
@@ -365,10 +367,10 @@ class TestDiffSimIntegration:
             device="cpu", tick_ns=1.0, gain=-1.0,
             baseline_noise_std=3.0,
         )
-        sim = DifferentiableOpticalSimulator(cfg)
+        sim = OpticalSimulator(cfg)
         sw = sim.simulate(
             torch.zeros(5, 3), torch.full((5,), 100), torch.zeros(5),
-            stitched=True, add_baseline_noise=True,
+            sliced=True, stochastic=False, add_baseline_noise=True,
         )
         from goop import SlicedWaveform
         assert isinstance(sw, SlicedWaveform)
@@ -386,7 +388,7 @@ class TestStreamingHistogram:
     ``sample_pdf`` + ``from_photons`` path on identical inputs.
     """
 
-    def _make_cfgs(self, sampler, *, baseline_noise_std=0.0, stream_chunk_size=7):
+    def _make_cfgs(self, sampler, *, baseline_noise_std=0.0, pos_batch_size=7):
         """Build paired configs identical except for the ``streaming`` flag."""
         ser = SERKernel(duration_ns=200.0, device=DEVICE)
 
@@ -397,7 +399,7 @@ class TestStreamingHistogram:
                 device="cpu", tick_ns=1.0, gain=-1.0,
                 baseline_noise_std=baseline_noise_std,
                 streaming=streaming,
-                stream_chunk_size=stream_chunk_size,
+                pos_batch_size=pos_batch_size,
             )
         return _build(False), _build(True)
 
@@ -420,17 +422,17 @@ class TestStreamingHistogram:
         sampler = _make_synth_library(cls=DifferentiableTOFSampler)
         cfg_def, cfg_str = self._make_cfgs(sampler)
 
-        sim_def = DifferentiableOpticalSimulator(cfg_def)
-        sim_str = DifferentiableOpticalSimulator(cfg_str)
+        sim_def = OpticalSimulator(cfg_def)
+        sim_str = OpticalSimulator(cfg_str)
 
         torch.manual_seed(0)
         pos = torch.linspace(-30, 30, 20).unsqueeze(-1).expand(-1, 3).contiguous()
         n_ph = torch.full((20,), 200.0)
         t_step = torch.linspace(0.0, 5.0, 20)
 
-        sw_def = sim_def.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        sw_def = sim_def.simulate(pos, n_ph, t_step, sliced=True, stochastic=False, add_baseline_noise=False)
         wf_def = sw_def.deslice()
-        wf_str = sim_str.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False).deslice()
+        wf_str = sim_str.simulate(pos, n_ph, t_step, sliced=True, stochastic=False, add_baseline_noise=False).deslice()
 
         # Align both onto a common time grid spanning the union.
         tick = wf_def.tick_ns
@@ -453,12 +455,12 @@ class TestStreamingHistogram:
         """Backward through ``streaming=True`` reaches ``n_photons``."""
         sampler = _make_synth_library(cls=DifferentiableTOFSampler)
         _, cfg_str = self._make_cfgs(sampler)
-        sim = DifferentiableOpticalSimulator(cfg_str)
+        sim = OpticalSimulator(cfg_str)
 
         pos = torch.zeros(10, 3)
         n_ph = torch.full((10,), 100.0, requires_grad=True)
         t_step = torch.zeros(10)
-        wf = sim.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
+        wf = sim.simulate(pos, n_ph, t_step, sliced=True, stochastic=False, add_baseline_noise=False)
         loss = wf.adc.pow(2).sum()
         loss.backward()
 

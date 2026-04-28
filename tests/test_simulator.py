@@ -38,7 +38,10 @@ class MockTOFSampler:
     def n_channels(self):
         return self._n_channels
 
-    def sample(self, pos, n_photons, t_step):
+    def sample_photons(
+        self, pos, n_photons, t_step, *,
+        stochastic: bool = True, return_source_idx: bool = False,
+    ):
         g = torch.Generator(device=DEVICE).manual_seed(self.seed)
         n = int(n_photons.sum().item()) if not isinstance(n_photons, int) else n_photons
         n_per_cluster = n // 2
@@ -47,12 +50,15 @@ class MockTOFSampler:
         times = torch.cat([t1, t2])
         channels = torch.randint(0, self._n_channels, (times.shape[0],), generator=g, device=DEVICE)
         times = times + t_step.mean()
-        source_idx = torch.arange(n, device=DEVICE) % pos.shape[0]
-        return times, channels, source_idx
+        weights = torch.ones_like(times)
+        if return_source_idx:
+            source_idx = torch.arange(n, device=DEVICE) % pos.shape[0]
+            return times, channels, weights, source_idx
+        return times, channels, weights
 
 
 class _SeededMockTOF:
-    """Returns same photons every call (for stitched vs full comparison)."""
+    """Returns same photons every call (for sliced vs full comparison)."""
 
     def __init__(self, n_channels=4, seed=123):
         self._n_channels = n_channels
@@ -73,12 +79,20 @@ class _SeededMockTOF:
     def n_channels(self):
         return self._n_channels
 
-    def sample(self, pos, n_photons, t_step):
+    def sample_photons(
+        self, pos, n_photons, t_step, *,
+        stochastic: bool = True, return_source_idx: bool = False,
+    ):
         if self._data is None:
             self._data = self._generate(n_photons)
-        n = self._data[0].shape[0]
-        source_idx = torch.arange(n, device=DEVICE) % pos.shape[0]
-        return self._data[0].clone(), self._data[1].clone(), source_idx
+        times = self._data[0].clone()
+        channels = self._data[1].clone()
+        weights = torch.ones_like(times)
+        if return_source_idx:
+            n = times.numel()
+            source_idx = torch.arange(n, device=DEVICE) % pos.shape[0]
+            return times, channels, weights, source_idx
+        return times, channels, weights
 
 
 # ---------------------------------------------------------------------------
@@ -332,16 +346,16 @@ class TestEdgeCases:
 
 
 class TestSimulateReturnsTypes:
-    def test_stitched_returns_sliced(self):
+    def test_sliced_returns_sliced(self):
         sim = _make_simulator()
-        result = sim.simulate(torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10), stitched=True)
+        result = sim.simulate(torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10), sliced=True)
         assert isinstance(result, SlicedWaveform)
         assert result.n_chunks >= 4  # at least one chunk per channel
         assert result.n_channels == 4
 
     def test_full_returns_waveform(self):
         sim = _make_simulator()
-        result = sim.simulate(torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10), stitched=False)
+        result = sim.simulate(torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10), sliced=False)
         assert isinstance(result, Waveform)
         assert result.adc.dim() == 2
         assert result.adc.shape[0] == 4
@@ -364,7 +378,7 @@ class TestSimulateReturnsTypes:
 class TestDeslice:
     def test_roundtrip(self):
         sim = _make_simulator()
-        sliced = sim.simulate(torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10), stitched=True)
+        sliced = sim.simulate(torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10), sliced=True)
         assert isinstance(sliced, SlicedWaveform)
 
         t0, ch_wf = sliced.deslice_channel(0)
@@ -534,8 +548,8 @@ class TestSliceDesliceClosure:
         n_ph = torch.full((200,), 500)
         t_step = torch.zeros(200)
 
-        sliced = sim.simulate(pos, n_ph, t_step, stitched=True)
-        full = sim.simulate(pos, n_ph, t_step, stitched=False)
+        sliced = sim.simulate(pos, n_ph, t_step, sliced=True)
+        full = sim.simulate(pos, n_ph, t_step, sliced=False)
         recovered = sliced.deslice()
 
         n_cmp = min(recovered.adc.shape[1], full.adc.shape[1])
@@ -549,7 +563,7 @@ class TestSliceDesliceClosure:
 
 
 # ---------------------------------------------------------------------------
-# Core validation: stitched vs full
+# Core validation: sliced vs full
 # ---------------------------------------------------------------------------
 
 class TestStitchedMatchesFull:
@@ -568,8 +582,8 @@ class TestStitchedMatchesFull:
         n_ph = torch.full((200,), 500)
         t_step = torch.zeros(200)
 
-        sliced = sim.simulate(pos, n_ph, t_step, stitched=True)
-        full = sim.simulate(pos, n_ph, t_step, stitched=False)
+        sliced = sim.simulate(pos, n_ph, t_step, sliced=True)
+        full = sim.simulate(pos, n_ph, t_step, sliced=False)
 
         assert isinstance(sliced, SlicedWaveform)
         assert isinstance(full, Waveform)
@@ -685,20 +699,18 @@ class TestDigitize:
 
 
 class TestDigitizeSTE:
-    """digitize_ste: same forward as digitize, identity backward."""
+    """digitize(..., ste=True): same forward as plain digitize, identity backward."""
 
     def test_forward_matches_digitize(self):
-        from goop.digitize import digitize_ste
         data = torch.linspace(-2000.0, 20000.0, 500)
         ref = digitize(data, pedestal=1500.0, n_bits=14)
-        ste = digitize_ste(data, pedestal=1500.0, n_bits=14)
+        ste = digitize(data, pedestal=1500.0, n_bits=14, ste=True)
         assert torch.equal(ref, ste), "STE forward must match plain digitize exactly"
 
     def test_backward_is_identity(self):
-        from goop.digitize import digitize_ste
         x = torch.tensor([100.0, 1500.0, 16000.0, -5000.0], requires_grad=True)
         # Sum of STE outputs → expected gradient wrt x is 1 everywhere
-        digitize_ste(x, pedestal=1500.0, n_bits=14).sum().backward()
+        digitize(x, pedestal=1500.0, n_bits=14, ste=True).sum().backward()
         assert torch.allclose(x.grad, torch.ones_like(x))
 
     def test_plain_digitize_blocks_grad(self):
@@ -826,7 +838,7 @@ class TestPipelineDigitization:
         pos = torch.zeros(10, 3)
         n_ph = torch.full((10,), 100)
         t = torch.zeros(10)
-        result = sim.simulate(pos, n_ph, t, stitched=True)
+        result = sim.simulate(pos, n_ph, t, sliced=True)
         assert isinstance(result, SlicedWaveform)
         # Output should be float, not quantized
         assert result.adc.dtype == torch.float32
@@ -841,7 +853,7 @@ class TestPipelineDigitization:
         ))
         result = sim.simulate(
             torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
-            stitched=False,
+            sliced=False,
         )
         assert isinstance(result, Waveform)
         assert torch.equal(result.adc, result.adc.round())
@@ -858,7 +870,7 @@ class TestPipelineDigitization:
         ))
         result = sim.simulate(
             torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
-            stitched=False,
+            sliced=False,
         )
         assert isinstance(result, Waveform)
 
@@ -874,7 +886,7 @@ class TestPipelineDigitization:
         ))
         result = sim.simulate(
             torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
-            stitched=True,
+            sliced=True,
         )
         assert isinstance(result, SlicedWaveform)
         assert result.adc.min().item() >= 0
@@ -995,7 +1007,7 @@ class TestOversamplePipeline:
         sim_os = OpticalSimulator(config_os)
         result_os = sim_os.simulate(
             torch.zeros(50, 3), torch.full((50,), 200), torch.zeros(50),
-            stitched=False,
+            sliced=False,
         )
 
         # manual fine-resolution pipeline
@@ -1008,7 +1020,7 @@ class TestOversamplePipeline:
         sim_fine = OpticalSimulator(config_fine)
         result_fine = sim_fine.simulate(
             torch.zeros(50, 3), torch.full((50,), 200), torch.zeros(50),
-            stitched=False,
+            sliced=False,
         )
         result_ds = result_fine.downsample(4)
 
@@ -1040,8 +1052,8 @@ class TestOversampleStitchedMatchesFull:
         n_ph = torch.full((50,), 200)
         t_step = torch.zeros(50)
 
-        sliced = sim.simulate(pos, n_ph, t_step, stitched=True)
-        full = sim.simulate(pos, n_ph, t_step, stitched=False)
+        sliced = sim.simulate(pos, n_ph, t_step, sliced=True)
+        full = sim.simulate(pos, n_ph, t_step, sliced=False)
         recovered = sliced.deslice()
 
         assert recovered.tick_ns == full.tick_ns
@@ -1078,8 +1090,8 @@ class TestOversampleBackwardCompat:
         n_ph = torch.full((50,), 200)
         t = torch.zeros(50)
 
-        r1 = OpticalSimulator(config1).simulate(pos, n_ph, t, stitched=False)
-        r2 = OpticalSimulator(config2).simulate(pos, n_ph, t, stitched=False)
+        r1 = OpticalSimulator(config1).simulate(pos, n_ph, t, sliced=False)
+        r2 = OpticalSimulator(config2).simulate(pos, n_ph, t, sliced=False)
 
         assert torch.allclose(r1.adc, r2.adc, atol=1e-6)
         assert r1.t0 == r2.t0
@@ -1103,11 +1115,11 @@ class TestSERJitter:
         r1 = OpticalSimulator(OpticalSimConfig(
             tof_sampler=mock1, delays=Delays([]), kernel=kernel,
             device="cpu", tick_ns=1.0, gain=-45.0,
-        )).simulate(pos, n_ph, t, stitched=False)
+        )).simulate(pos, n_ph, t, sliced=False)
         r2 = OpticalSimulator(OpticalSimConfig(
             tof_sampler=mock2, delays=Delays([]), kernel=kernel,
             device="cpu", tick_ns=1.0, gain=-45.0, ser_jitter_std=0.0,
-        )).simulate(pos, n_ph, t, stitched=False)
+        )).simulate(pos, n_ph, t, sliced=False)
 
         assert torch.allclose(r1.adc, r2.adc, atol=1e-6)
 
@@ -1143,7 +1155,7 @@ class TestSERJitter:
         ))
         result = sim.simulate(
             torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
-            stitched=True,
+            sliced=True,
         )
         assert isinstance(result, SlicedWaveform)
 
@@ -1183,11 +1195,11 @@ class TestBaselineNoise:
         r1 = OpticalSimulator(OpticalSimConfig(
             tof_sampler=mock1, delays=Delays([]), kernel=kernel,
             device="cpu", tick_ns=1.0, gain=-45.0,
-        )).simulate(pos, n_ph, t, stitched=False)
+        )).simulate(pos, n_ph, t, sliced=False)
         r2 = OpticalSimulator(OpticalSimConfig(
             tof_sampler=mock2, delays=Delays([]), kernel=kernel,
             device="cpu", tick_ns=1.0, gain=-45.0, baseline_noise_std=0.0,
-        )).simulate(pos, n_ph, t, stitched=False)
+        )).simulate(pos, n_ph, t, sliced=False)
 
         assert torch.allclose(r1.adc, r2.adc, atol=1e-6)
 
@@ -1209,7 +1221,7 @@ class TestBaselineNoise:
         ))
         result = sim.simulate(
             torch.zeros(1, 3), torch.zeros(1, dtype=torch.int32), torch.zeros(1),
-            stitched=False,
+            sliced=False,
         )
         # convolution of empty histogram is ~zero, noise dominates
         measured_std = result.adc.std().item()
@@ -1227,7 +1239,7 @@ class TestBaselineNoise:
         ))
         result = sim.simulate(
             torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
-            stitched=False,
+            sliced=False,
         )
         assert isinstance(result, Waveform)
         assert torch.equal(result.adc, result.adc.round())
@@ -1235,7 +1247,7 @@ class TestBaselineNoise:
         assert result.adc.max().item() <= 16383
 
     def test_noise_sliced(self):
-        """Baseline noise works with stitched output."""
+        """Baseline noise works with sliced output."""
         sim = OpticalSimulator(OpticalSimConfig(
             tof_sampler=MockTOFSampler(n_channels=4),
             delays=Delays([]),
@@ -1245,6 +1257,6 @@ class TestBaselineNoise:
         ))
         result = sim.simulate(
             torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
-            stitched=True,
+            sliced=True,
         )
         assert isinstance(result, SlicedWaveform)

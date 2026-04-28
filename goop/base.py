@@ -9,30 +9,46 @@ import torch
 
 
 class TOFSamplerBase(ABC):
-    """Base class for time-of-flight samplers."""
+    """Base class for time-of-flight samplers.
+
+    Implementations must provide both photon-list and dense-histogram outputs,
+    each in two flavours selected by ``stochastic``: Poisson sampling for stochastic mode,
+    deterministic PDF deposition for expectation mode.
+    """
 
     @abstractmethod
-    def sample(
+    def sample_photons(
         self,
         pos: torch.Tensor,
         n_photons: torch.Tensor,
         t_step: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample photon arrival times and channel IDs.
+        *,
+        stochastic: bool = True,
+        return_source_idx: bool = False,
+    ):
+        """Return ``(times, channels, weights[, source_idx])``.
 
-        Parameters
-        ----------
-        pos : (N, 3) positions in mm.
-        n_photons : (N,) photons emitted per step.
-        t_step : (N,) emission time per step in ns.
-
-        Returns
-        -------
-        times : (M,) detected photon arrival times in ns.
-        channels : (M,) PMT channel IDs.
-        source_idx : (M,) index into *pos* identifying which input position
-            produced each photon.
+        Stochastic mode: weights are unit (1.0); ``source_idx`` (when
+        requested) is the per-photon global position index.
+        Expectation mode: weights carry probability mass; the sampler emits
+        ``Q`` ghost photons per active (position, PMT) pair.
         """
+        ...
+
+    @abstractmethod
+    def sample_histogram(
+        self,
+        pos: torch.Tensor,
+        n_photons: torch.Tensor,
+        t_step: torch.Tensor,
+        *,
+        stochastic: bool = True,
+        tick_ns: float,
+        n_bins: int,
+        t0_ref: float = 0.0,
+    ) -> torch.Tensor:
+        """Return a dense ``(2P, n_bins)`` histogram. Returns ``int32`` for
+        ``stochastic=True``, ``float32`` (and differentiable) otherwise."""
         ...
 
     @property

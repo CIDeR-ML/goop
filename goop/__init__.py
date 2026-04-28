@@ -8,7 +8,6 @@ from .delays import (
     TTSDelay,
     create_default_delays,
 )
-from .diff_simulator import DifferentiableOpticalSimulator
 from .digitize import DigitizationConfig
 from .io import load_event_light, save_event_light, write_config_light, save_event_light_w_tpc, load_event_light_w_tpc
 from .kernels import (
@@ -55,7 +54,6 @@ __all__ = [
     "TPBTriexponentialKernel",
     "TTSKernel",
     "create_default_response",
-    "DifferentiableOpticalSimulator",
     "DifferentiableTOFSampler",
     "PCATOFSampler",
     "TOFSampler",

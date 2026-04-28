@@ -253,7 +253,7 @@ def main():
     jax.block_until_ready(warmup_filled.volumes[0].charge)
     pos, nph, tns, lbl, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
     warmup_wfs = goop_sim.simulate(pos, nph, tns, labels=lbl,
-                                   stitched=True, subtract_t0=True)
+                                   sliced=True, subtract_t0=True)
     del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl
     gc.collect()
     torch.cuda.empty_cache()
@@ -370,7 +370,7 @@ def main():
                         extract_goop_inputs(filled, cfg, label_key)
                     waveforms = goop_sim.simulate(
                         pos_mm, n_ph, t_ns,
-                        labels=labels, stitched=True, subtract_t0=True)
+                        labels=labels, sliced=True, subtract_t0=True)
 
                     # 4.1 - Align Waveforms
                     if should_align:
