@@ -47,6 +47,7 @@ from goop.noise import DarkNoise
 from goop.digitize import DigitizationConfig
 from goop.sampler import create_default_tof_sampler
 from goop.io import write_config_light, save_event_light, save_event_light_w_tpc
+from goop.utils import voxelize
 
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -449,7 +450,7 @@ def main():
                         filled, cfg, label_key)
                     waveforms, pos_new, n_ph_new, t_ns_new, labels_new, pdg_new, des_new = goop_sim.simulate(
                         pos_mm, n_ph, t_ns, labels=labels, pdgs=pdgs, de=des,
-                        stitched=True, subtract_t0=True, return_tpc=True)
+                        stitched=True, subtract_t0=True, return_tpc=True, do_voxelize=True)
 
                     # 4.1 - Align Waveforms
                     if should_align:
