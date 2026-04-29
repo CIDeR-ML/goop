@@ -61,6 +61,8 @@ python3 production/run_batch.py \
 | `--workers` | 2 | Number of save worker threads (0 = serial) |
 | `--seed` | 42 | Random seed |
 | `--align` | off | Align chunks when returning `List[SlicedWaveform]` |
+| `--time-window-ns` | 10000 | Time window to mimic the beam window |
+| `--label-dist` | Uniform | [Uniform, Poisson, HalfNormal] Type of distribution to sample N interactions |
 
 ## Pipeline
 

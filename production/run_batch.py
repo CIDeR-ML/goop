@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from torch.distributions import Poisson, Uniform, HalfNormal
 
 from tools.geometry import generate_detector
 from tools.simulation import DetectorSimulator
@@ -44,8 +45,8 @@ from goop.kernels import SERKernel
 from goop.delays import ScintillationBiexponentialDelay, TPBTriexponentialDelay, TTSDelay
 from goop.noise import DarkNoise
 from goop.digitize import DigitizationConfig
-from goop.sampler import create_default_tof_sampler, create_siren_tof_sampler
-from goop.io import write_config_light, save_event_light
+from goop.sampler import create_default_tof_sampler
+from goop.io import write_config_light, save_event_light, save_event_light_w_tpc
 from goop.utils import voxelize
 
 
@@ -60,6 +61,10 @@ def get_num_events(data_path):
     with h5py.File(data_path, 'r') as f:
         return f['pstep/lar_vol'].shape[0]
 
+def get_num_labels(dist:torch.distributions.Distribution):
+    if dist is None:
+        return 10
+    return round(dist.sample((1,)).item())
 
 LABEL_FIELDS = {
     'volume': None,           # synthetic: filled with volume index
@@ -83,26 +88,50 @@ def extract_goop_inputs(filled, cfg, label_key='interaction'):
     """
     field = LABEL_FIELDS[label_key]
     all_pos, all_nph, all_t, all_labels = [], [], [], []
+    all_pdgs, all_des = [], []
     total_segs = 0
     for v in range(cfg.n_volumes):
         vol = filled.volumes[v]
+        vol_cfg = cfg.volumes[v]                      # ← config, has geometry
         n = vol.n_actual
         if n == 0:
             continue
+        # shift the positions to the global coordinate system of the volume
+        pos = vol.positions_mm[:n]
+        x_anode_mm  = vol_cfg.x_anode_cm * 10.0
+        drift_dir   = vol_cfg.drift_direction
+        y_center_mm = vol_cfg.yz_center_cm[0] * 10.0
+        z_center_mm = vol_cfg.yz_center_cm[1] * 10.0
+        
+        x_global = x_anode_mm - drift_dir * pos[:, 0]
+        y_global = pos[:, 1] + y_center_mm
+        z_global = pos[:, 2] + z_center_mm
+        pos = jnp.stack([x_global, y_global, z_global], axis=1)
         total_segs += n
-        all_pos.append(vol.positions_mm[:n])
+        all_pos.append(pos)
         all_nph.append(jnp.ceil(vol.photons[:n]).astype(jnp.int32))
         all_t.append(vol.t0_us[:n] * 1000.0)  # us -> ns
+        all_pdgs.append(vol.pdg[:n])
+        all_des.append(vol.de[:n])
         if field is None:
             all_labels.append(jnp.full((n,), v, dtype=jnp.int32))
         else:
-            all_labels.append(getattr(vol, field)[:n].astype(jnp.int32))
+            raw = getattr(vol, field)[:n].astype(jnp.int32)
+            # Combine volume index into the ID so interactions with the same
+            # local ID in different volumes don't collide:
+            #   combined = 1_000_000 + 1000 * v + orig_id  (sentinel -1 kept)
+            #combined = jnp.where(raw == -1, jnp.int32(-1),
+            #                     jnp.int32(1_000_000 + 1000 * v) + raw)
+            #all_labels.append(combined)
+            all_labels.append(raw)
 
     pos_mm = jnp.concatenate(all_pos)
     n_photons = jnp.concatenate(all_nph)
     t_step_ns = jnp.concatenate(all_t)
     labels = jnp.concatenate(all_labels)
-    return pos_mm, n_photons, t_step_ns, labels, total_segs
+    pdgs = jnp.concatenate(all_pdgs)
+    dEs = jnp.concatenate(all_des)
+    return pos_mm, n_photons, t_step_ns, labels, pdgs, dEs, total_segs
 
 
 def voxelize_labeled(pos_mm, n_photons, t_step_ns, labels, dx,
@@ -163,6 +192,9 @@ def main():
                         choices=list(LABEL_FIELDS.keys()),
                         help='Deposit label for per-waveform separation '
                              '(default: interaction)')
+    parser.add_argument('--label-dist', default='Uniform',
+                        choices=['Uniform', 'Poisson', 'HalfNormal', 'Fixed'],
+                        help='Distribution for label sampling (default: Uniform)')
     # Digitization
     parser.add_argument('--n-bits', type=int, default=15,
                         help='ADC bit depth (default: 15)')
@@ -181,6 +213,9 @@ def main():
                         help='Gaussian baseline noise std (default: 0.0)')
     parser.add_argument('--ser-jitter-std', type=float, default=0.1,
                         help='SER jitter std (default: 0.1)')
+    parser.add_argument('--time-window-ns', type=int, default=10000,
+                        help='Time window for GOOP simulation in ns (default: 10000)')
+
     # Timing / oversampling
     parser.add_argument('--tick-ns', type=float, default=1.0,
                         help='Output time bin width in ns (default: 1.0)')
@@ -206,6 +241,7 @@ def main():
                         help='Number of save worker threads (0=serial, default: 2)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--align', action='store_true', help='Requires subtract_t0=True in goop_sim.simulate()')
+
     args = parser.parse_args()
 
     include_digitize = not args.no_digitize
@@ -215,11 +251,27 @@ def main():
     events_per_file = args.events_per_file
     dataset_name = args.dataset
     label_key = args.label_key
+    label_dist = args.label_dist
     should_align = args.align
+    time_window_ns = args.time_window_ns
 
     total_events = get_num_events(args.data)
     num_events = min(args.events, total_events) if args.events else total_events
     num_files = (num_events + events_per_file - 1) // events_per_file
+
+
+    if label_dist == 'Uniform':
+        label_dist = Uniform(low=1, high=15)
+    elif label_dist == 'Poisson':
+        label_dist = Poisson(lam=10)
+    elif label_dist == 'HalfNormal':
+        label_dist = HalfNormal(scale=10)
+    elif label_dist == 'Fixed':
+        label_dist = None
+    else:
+        raise ValueError(f'Invalid label distribution: {label_dist}')
+    
+    N_labels = get_num_labels(label_dist)
 
     # Output directory
     sensor_dir = os.path.join(args.outdir, 'sensor')
@@ -251,6 +303,8 @@ def main():
     print(f'  JAX device:     {jax.devices()[0]}')
     print(f'  CUDA device:    {torch.cuda.get_device_name(0)}')
     print(f'  Output:         {sensor_dir}/')
+    print(f'  Label dist:     {label_dist}')
+    print(f'  Time window:    {time_window_ns} ns')
     print()
 
     # ---- Create jaxtpc simulator (light-only) ----
@@ -283,6 +337,8 @@ def main():
         tick_ns=args.tick_ns,
         kernel=SERKernel(device=torch.device("cuda"), duration_ns=10000),
         gain=gain,
+        n_labels_to_simulate=N_labels,
+        time_window_ns=time_window_ns,
         oversample=args.oversample,
         ser_jitter_std=args.ser_jitter_std,
         baseline_noise_std=args.baseline_noise_std,
@@ -302,12 +358,11 @@ def main():
     warmup_dep = load_event(args.data, cfg, event_idx=0)
     warmup_filled = jaxtpc_sim.process_event_light(warmup_dep)
     jax.block_until_ready(warmup_filled.volumes[0].charge)
-    pos, nph, tns, lbl, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
-    if args.voxel_dx > 0:
-        pos, nph, tns, lbl = voxelize_labeled(pos, nph, tns, lbl, args.voxel_dx)
-    warmup_wfs = goop_sim.simulate(pos, nph, tns, labels=lbl,
-                                   stitched=True, subtract_t0=True)
-    del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl
+    pos, nph, tns, lbl, pdg, des, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
+    warmup_wfs = goop_sim.simulate(
+        pos, nph, tns, labels=lbl, pdgs=pdg, de=des, stitched=True, subtract_t0=True, return_tpc=False
+    )
+    del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl, pdg, des
     gc.collect()
     torch.cuda.empty_cache()
     t_warmup = time.time() - t_warmup
@@ -327,13 +382,30 @@ def main():
                 digitized=include_digitize,
                 n_bits=n_bits if include_digitize else 0)
 
+    def save_one_event_with_tpc(f, item):
+        """Save a single event to HDF5 with TPC data. Thread-safe via file_lock."""
+        event_key, waveforms_cpu, source_idx, positions, n_photons, t_step, labels, de, pdg = item
+        with file_lock:
+            save_event_light_w_tpc(
+                f, event_key, waveforms_cpu,
+                positions=positions,
+                n_photons=n_photons,
+                t_step=t_step,
+                labels=labels,
+                de=de,
+                pdg=pdg,
+                source_event_idx=source_idx,
+                digitized=include_digitize,
+                n_bits=n_bits if include_digitize else 0)
+
     def save_worker(f, q):
         """Worker thread: pull items from queue, save to HDF5."""
         while True:
             item = q.get()
             if item is None:
                 break
-            save_one_event(f, item)
+            #save_one_event(f, item)
+            save_one_event_with_tpc(f, item)
             q.task_done()
 
     def waveforms_to_cpu(waveforms):
@@ -403,6 +475,10 @@ def main():
                     local_idx = evt_idx - event_start
                     event_key = f'event_{local_idx:03d}'
 
+                    n_labels = get_num_labels(label_dist)
+                    goop_config.n_labels_to_simulate = n_labels
+                    goop_sim = OpticalSimulator(goop_config)
+                    print(f"  sampled {n_labels} interactions from {label_dist}")
                     # 1. Collect prefetched deposits
                     t0 = time.time()
                     deposits = future.result()
@@ -420,20 +496,12 @@ def main():
 
                     # 4. Extract inputs & run GOOP
                     t0 = time.time()
-                    pos_mm, n_ph, t_ns, labels, total_segs = \
-                        extract_goop_inputs(filled, cfg, label_key)
-                    n_after = total_segs
-                    t_vox = 0.0
-                    if args.voxel_dx > 0:
-                        tv0 = time.time()
-                        pos_mm, n_ph, t_ns, labels = voxelize_labeled(
-                            pos_mm, n_ph, t_ns, labels, args.voxel_dx,
-                        )
-                        t_vox = time.time() - tv0
-                        n_after = pos_mm.shape[0]
-                    waveforms = goop_sim.simulate(
-                        pos_mm, n_ph, t_ns,
-                        labels=labels, stitched=True, subtract_t0=True)
+
+                    pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = extract_goop_inputs(
+                        filled, cfg, label_key)
+                    waveforms, pos_new, n_ph_new, t_ns_new, labels_new, pdg_new, des_new = goop_sim.simulate(
+                        pos_mm, n_ph, t_ns, labels=labels, pdgs=pdgs, de=des,
+                        stitched=True, subtract_t0=True, return_tpc=True, do_voxelize=True)
 
                     # 4.1 - Align Waveforms
                     if should_align:
@@ -452,12 +520,12 @@ def main():
                     # 4. GPU → CPU transfer + save (serial or queued)
                     t0 = time.time()
                     waveforms_cpu = waveforms_to_cpu(waveforms)
-                    item = (event_key, waveforms_cpu, evt_idx)
+                    item = (event_key, waveforms_cpu, evt_idx, pos_new, n_ph_new, t_ns_new, labels_new, des_new, pdg_new)
 
                     if num_workers > 0:
                         save_queue.put(item)
                     else:
-                        save_one_event(f, item)
+                        save_one_event_with_tpc(f, item)
                     t_save = time.time() - t0
 
                     t_total = t_load + t_light + t_goop_elapsed + t_save
@@ -474,7 +542,7 @@ def main():
                           f"{t_total:>5.1f}s")
 
                     del deposits, filled, waveforms, waveforms_cpu
-                    del pos_mm, n_ph, t_ns, labels
+                    del pos_mm, n_ph, t_ns, labels, pdgs, des, pos_new, n_ph_new, t_ns_new, labels_new, pdg_new, des_new
                     gc.collect()
 
             # Wait for workers to finish

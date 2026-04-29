@@ -26,7 +26,7 @@ from .waveform import SlicedWaveform, Waveform
 
 ArrayLike = Union[torch.Tensor, Any]
 
-# Padding constants for the time-grouping path.
+# Padding constants for V2 sparse streaming time-grouping.
 _GAP_THRESHOLD_PAD_NS = 100.0  # safety margin so a gap-split can't bisect a kernel-extent tail
 _N_BINS_GROUP_PAD = 10         # extra bins so late photons aren't truncated by integer rounding
 

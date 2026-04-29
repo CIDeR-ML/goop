@@ -143,7 +143,7 @@ By default the differentiable simulator builds the full event histogram in one p
 
 ```python
 from goop import (
-    OpticalSimConfig, OpticalSimulator,
+    OpticalSimConfig, DifferentiableOpticalSimulator, Optical 
     Response, SERKernel, create_siren_tof_sampler, voxelize,
 )
 from goop.delays import Delays
@@ -334,9 +334,10 @@ Each pipeline component is defined by an abstract base class (`base.py`), making
 | `oversample` | 1 | Internal oversampling factor; bins and convolves at `tick_ns / oversample`, then averages down |
 | `ser_jitter_std` | 0.0 | Std of multiplicative Gaussian on per-PE weights (models dynode gain fluctuations) |
 | `baseline_noise_std` | 0.0 | Std of per-sample Gaussian ADC noise added post-convolution |
-| `streaming` | True | (Used when `stochastic=False, sliced=True`) Time-island streaming histogram — peak memory scales with the largest activity burst, not the whole event. Set `False` only for debugging / parity checks. |
-| `pos_batch_size` | 5000 | Segments per gradient-checkpointed micro-batch inside `sample_histogram` |
-| `checkpoint` | True | Per-chunk `torch.utils.checkpoint` in the streaming path; turn off at small N (e.g. after voxelization) |
+| `streaming` | True | (Diff-sim only) Time-grouped streaming histogram — peak memory scales with the largest activity burst, not the whole event. Set to `False` only for debugging / `sample_pdf` parity checks. |
+| `stream_chunk_size` | 5000 | Segments per gradient-checkpointed micro-batch inside `histogram_pdf` |
+| `stream_checkpoint` | True | Per-chunk `torch.utils.checkpoint` in the streaming path; turn off at small N (e.g. after voxelization) |
+
 
 **`simulate()` options**:
 | Parameter | Default | Description |

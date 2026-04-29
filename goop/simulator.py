@@ -17,6 +17,7 @@ from .sampler import create_default_tof_sampler
 from .delays import Delays, create_default_delays
 from .kernels import create_default_kernel
 from .waveform import SlicedWaveform, Waveform
+from .utils import voxelize
 
 @dataclass
 class OpticalSimConfig:
@@ -45,6 +46,8 @@ class OpticalSimConfig:
     stream_chunk_size: int = 5000
     stream_checkpoint: bool = True    # per-chunk gradient checkpoint in histogram_pdf;
                                        # disable for small N (e.g. after voxelization)
+
+    voxel_size_mm: float = 10.0 # mm
 
     def __post_init__(self):
         if not isinstance(self.oversample, int) or self.oversample < 1:
@@ -199,9 +202,10 @@ class OpticalSimulator:
 
         # Per-label aux sources in virtual channel space
         if cfg.aux_photon_sources and b_times.numel() > 0:
+            b_times_real = b_times  # snapshot before aux sources grow b_times
             for li in range(n_batch):
                 lbl_mask = b_photon_labels == batch_labels[li]
-                lbl_t = b_times[lbl_mask]
+                lbl_t = b_times_real[lbl_mask]
                 if lbl_t.numel() == 0:
                     continue
                 t_start, t_end = lbl_t.min().item(), lbl_t.max().item()
@@ -226,11 +230,14 @@ class OpticalSimulator:
         n_photons: ArrayLike,
         t_step: ArrayLike,
         labels: Optional[ArrayLike] = None,
+        pdgs: Optional[ArrayLike] = None,
+        de: Optional[ArrayLike] = None,
         stitched: bool = True,
         subtract_t0: bool = False,
         add_baseline_noise: bool = True,
         label_batch_size: Optional[int] = None,
         return_tpc: bool = False,
+        do_voxelize: bool = False,
     ) -> Union[SlicedWaveform, Waveform, List[SlicedWaveform]]:
         """
         Run the full optical simulation pipeline.
@@ -269,19 +276,32 @@ class OpticalSimulator:
             torch.from_dlpack(a) if not isinstance(a, torch.Tensor) else a
             for a in (pos, n_photons, t_step)
         )
+        if pdgs is not None:
+            pdgs = torch.from_dlpack(pdgs) if not isinstance(pdgs, torch.Tensor) else pdgs
+        if de is not None:
+            de = torch.from_dlpack(de) if not isinstance(de, torch.Tensor) else de
         pos = pos.to(device=device, dtype=torch.float32)
         n_photons = n_photons.to(device=device)
         t_step = t_step.to(device=device, dtype=torch.float32)
+        if pdgs is not None:
+            pdgs = pdgs.to(device=device, dtype=torch.float32)
+        if de is not None:
+            de = de.to(device=device, dtype=torch.float32)
+
 
         if labels is not None:
             labels = (
                 torch.from_dlpack(labels) if not isinstance(labels, torch.Tensor) else labels
             ).to(dtype=torch.long, device=device)
+            # unique_tpc_labels: sorted tensor of ALL unique valid labels.
+            # Used for t_step preprocessing so every label is normalised correctly.
             unique_tpc_labels = torch.unique(labels[labels >= 0])
 
         if subtract_t0:
             if labels is not None:
                 # Step 1: normalise each label group so its minimum t_step is 0.
+                # Uses unique_tpc_labels (all labels, sorted) so searchsorted is valid
+                # for every label present in the input.
                 valid_mask = labels >= 0
                 label_indices = torch.searchsorted(unique_tpc_labels, labels.clamp(min=0))
                 per_label_min = torch.full(
@@ -296,6 +316,7 @@ class OpticalSimulator:
 
         if labels is not None and cfg.time_window_ns is not None:
             valid_mask = labels >= 0
+            # Again use unique_tpc_labels (sorted, all labels) for searchsorted.
             label_indices = torch.searchsorted(unique_tpc_labels, labels[valid_mask])
             # Step 2: random per-label start time within [0, time_window_ns)
             rand_t0_per_label = torch.rand(len(unique_tpc_labels), device=device) * cfg.time_window_ns
@@ -305,11 +326,24 @@ class OpticalSimulator:
             # Step 3: drop valid-label points that exceed the window; always keep label=-1.
             keep = valid_mask & (t_step <= cfg.time_window_ns)
             pos_masked, n_photons_masked, t_step_masked, labels_masked = pos[keep], n_photons[keep], t_step[keep], labels[keep]
-            print(f"max n_photons: {n_photons_masked.max()}, min n_photons: {n_photons_masked.min()}")
+            pdgs_masked, de_masked = pdgs[keep], de[keep]
+            if do_voxelize:
+                pos_vox, n_photons_vox, t_step_vox = voxelize(pos_masked, n_photons_masked, t_step_masked, dx=cfg.voxel_size_mm)
+                times, channels, source_idx = cfg.tof_sampler.sample(pos_vox, n_photons_vox, t_step=t_step_vox)
+            else:
+                times, channels, source_idx = cfg.tof_sampler.sample(pos_masked, n_photons_masked, t_step=t_step_masked)
 
-        # 1. TOF sampling (batched across all positions)
-        times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
+        else:
+            # 1. TOF sampling (batched across all positions)
+            if do_voxelize:
+                pos_vox, n_photons_vox, t_step_vox = voxelize(pos, n_photons, t_step, dx=cfg.voxel_size_mm)
+                times, channels, source_idx = cfg.tof_sampler.sample(pos_vox, n_photons_vox, t_step=t_step_vox)
+            else:
+                times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
+            # No time-window filter: all valid positions are "kept".
 
+            pdgs_masked, de_masked = pdgs, de
+            labels_masked = labels if labels is not None else None
         # 2. Stochastic delays
         if times.numel() > 0:
             times = times + cfg.delays.sample(times.shape[0], device)
@@ -320,18 +354,24 @@ class OpticalSimulator:
         deslice_fill = (
             float(cfg.digitization.pedestal) if cfg.digitization is not None else 0.0
         )
-
-        # Labeled mode
+        # Labeled mode — choose which labels to generate waveforms for.
+        # This is done *after* t_step preprocessing so the subset selection
+        # does not corrupt the normalisation of non-simulated labels.
         if labels is not None:
-            photon_labels = labels[source_idx] if times.numel() > 0 else torch.empty(0, dtype=torch.long, device=device)
-            unique_labels = torch.unique(photon_labels[photon_labels >= 0])[:cfg.n_labels_to_simulate]
+            if cfg.n_labels_to_simulate is not None and cfg.n_labels_to_simulate < len(unique_tpc_labels):
+                perm = torch.randperm(len(unique_tpc_labels), device=device)[:cfg.n_labels_to_simulate]
+                # Sort so that downstream searchsorted calls remain valid.
+                unique_labels_to_simulate = unique_tpc_labels[perm].sort().values
+            else:
+                unique_labels_to_simulate = unique_tpc_labels
 
-            n_labels = len(unique_labels)
+            photon_labels = labels_masked[source_idx] if times.numel() > 0 else torch.empty(0, dtype=torch.long, device=device)
+            n_labels = len(unique_labels_to_simulate)
             bs = label_batch_size or n_labels
             sliced_results: List[SlicedWaveform] = []
             for start in range(0, n_labels, bs):
-                batch_labels = unique_labels[start:start + bs]
-                sliced_results.extend(self._simulate_labeled_batch(
+                batch_labels = unique_labels_to_simulate[start:start + bs]
+                results.extend(self._simulate_labeled_batch(
                     times, channels, photon_labels, batch_labels,
                 ))
 
@@ -346,12 +386,18 @@ class OpticalSimulator:
                 ]
 
             if return_tpc:
+                # Keep only TPC points whose label was actually simulated,
+                # so the returned arrays align 1-to-1 with `results`.
+                sim_mask = torch.isin(labels_masked, unique_labels_to_simulate)
+                pdgs_masked, de_masked = pdgs_masked[sim_mask], de_masked[sim_mask]
                 return (
                     results,
-                    pos_masked.cpu().numpy(),
-                    n_photons_masked.cpu().numpy(),
-                    t_step_masked.cpu().numpy(),
-                    labels_masked.cpu().numpy(),
+                    (pos_masked[sim_mask]).cpu().numpy(),
+                    (n_photons_masked[sim_mask]).cpu().numpy(),
+                    (t_step_masked[sim_mask]).cpu().numpy(),
+                    (labels_masked[sim_mask]).cpu().numpy(),
+                    (pdgs_masked).cpu().numpy(),
+                    (de_masked).cpu().numpy(),
                 )
             return results
 

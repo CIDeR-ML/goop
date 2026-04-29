@@ -119,12 +119,12 @@ class Waveform:
         )
 
     def deslice(self, fill: Optional[float] = None) -> Waveform:
-        """No-op on a dense `Waveform` — returns `self`.
+        """No-op on a dense ``Waveform`` — returns ``self``.
 
-        Provided for interface parity with `SlicedWaveform.deslice()` so
+        Provided for interface parity with ``SlicedWaveform.deslice()`` so
         downstream code doesn't need to care which kind of waveform the
         simulator produced (e.g. the streaming diff-sim returns a dense
-        `Waveform` directly rather than a `SlicedWaveform`).
+        ``Waveform`` directly rather than a ``SlicedWaveform``).
         """
         return self
 
