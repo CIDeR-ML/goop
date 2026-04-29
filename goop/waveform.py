@@ -457,17 +457,41 @@ class SlicedWaveform:
         )
 
     def convolve(self, kernel: torch.Tensor, gain: float) -> SlicedWaveform:
-        """FFT-convolve each chunk independently with kernel and apply gain."""
+        """FFT-convolve each chunk independently with kernel and apply gain.
+
+        Per-PMT, only the *last* chunk (largest `t0_ns`) keeps the linear-conv
+        extension of `conv_ticks - 1` trailing bins (the SER tail of late
+        photons). Earlier chunks are truncated to `chunk_data.numel()` so that
+        their post-conv extents — which are guaranteed to be zero, since
+        `slice()` keeps `kernel_extent_bins` of trailing zeros — don't reach
+        into the start of the next chunk for the same PMT and corrupt
+        `deslice()`'s scatter (which is non-deterministic on duplicate
+        destination indices on CUDA).
+        """
         conv_ticks = kernel.shape[0]
         device = self.adc.device
         new_pieces: List[torch.Tensor] = []
         new_offsets = [0]
         k_fft_cache: dict = {}
 
+        if self.n_chunks > 0:
+            max_t0_per_pmt = torch.full(
+                (self.n_channels,), float("-inf"),
+                device=device, dtype=self.t0_ns.dtype,
+            )
+            max_t0_per_pmt = max_t0_per_pmt.scatter_reduce(
+                0, self.pmt_id, self.t0_ns, reduce="amax", include_self=True,
+            )
+            is_last_per_pmt = self.t0_ns == max_t0_per_pmt[self.pmt_id]
+            is_last_cpu = is_last_per_pmt.tolist()
+        else:
+            is_last_cpu = []
+
         for k in range(self.n_chunks):
             chunk_data = self.adc[self.offsets[k]:self.offsets[k + 1]]
-            out_len = chunk_data.numel() + conv_ticks - 1
-            n_fft = _next_fft_size(out_len)
+            extend = conv_ticks - 1 if is_last_cpu[k] else 0
+            out_len = chunk_data.numel() + extend
+            n_fft = _next_fft_size(chunk_data.numel() + conv_ticks - 1)
 
             if n_fft not in k_fft_cache:
                 k_fft_cache[n_fft] = torch.fft.rfft(kernel, n=n_fft)
