@@ -17,6 +17,7 @@ from .sampler import create_default_tof_sampler
 from .delays import Delays, create_default_delays
 from .kernels import create_default_kernel
 from .waveform import SlicedWaveform, Waveform
+from .utils import voxelize
 
 @dataclass
 class OpticalSimConfig:
@@ -46,6 +47,8 @@ class OpticalSimConfig:
     stream_chunk_size: int = 5000
     stream_checkpoint: bool = True    # per-chunk gradient checkpoint in histogram_pdf;
                                        # disable for small N (e.g. after voxelization)
+
+    voxel_size_mm: float = 10.0 # mm
 
     def __post_init__(self):
         if not isinstance(self.oversample, int) or self.oversample < 1:
@@ -223,6 +226,7 @@ class OpticalSimulator:
         add_baseline_noise: bool = True,
         label_batch_size: Optional[int] = None,
         return_tpc: bool = False,
+        do_voxelize: bool = False,
     ) -> Union[SlicedWaveform, Waveform, List[SlicedWaveform]]:
         """
         Run the full optical simulation pipeline.
@@ -312,16 +316,23 @@ class OpticalSimulator:
             keep = valid_mask & (t_step <= cfg.time_window_ns)
             pos_masked, n_photons_masked, t_step_masked, labels_masked = pos[keep], n_photons[keep], t_step[keep], labels[keep]
             pdgs_masked, de_masked = pdgs[keep], de[keep]
-            times, channels, source_idx = cfg.tof_sampler.sample(pos_masked, n_photons_masked, t_step=t_step_masked)
+            if do_voxelize:
+                pos_vox, n_photons_vox, t_step_vox = voxelize(pos_masked, n_photons_masked, t_step_masked, dx=cfg.voxel_size_mm)
+                times, channels, source_idx = cfg.tof_sampler.sample(pos_vox, n_photons_vox, t_step=t_step_vox)
+            else:
+                times, channels, source_idx = cfg.tof_sampler.sample(pos_masked, n_photons_masked, t_step=t_step_masked)
 
         else:
             # 1. TOF sampling (batched across all positions)
-            times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
+            if do_voxelize:
+                pos_vox, n_photons_vox, t_step_vox = voxelize(pos, n_photons, t_step, dx=cfg.voxel_size_mm)
+                times, channels, source_idx = cfg.tof_sampler.sample(pos_vox, n_photons_vox, t_step=t_step_vox)
+            else:
+                times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
             # No time-window filter: all valid positions are "kept".
-            pos_masked, n_photons_masked, t_step_masked = pos, n_photons, t_step
+
             pdgs_masked, de_masked = pdgs, de
             labels_masked = labels if labels is not None else None
-
         # 2. Stochastic delays
         if times.numel() > 0:
             times = times + cfg.delays.sample(times.shape[0], device)
@@ -355,12 +366,12 @@ class OpticalSimulator:
                 pdgs_masked, de_masked = pdgs_masked[sim_mask], de_masked[sim_mask]
                 return (
                     results,
-                    pos_masked[sim_mask].cpu().numpy(),
-                    n_photons_masked[sim_mask].cpu().numpy(),
-                    t_step_masked[sim_mask].cpu().numpy(),
-                    labels_masked[sim_mask].cpu().numpy(),
-                    pdgs_masked.cpu().numpy(),
-                    de_masked.cpu().numpy(),
+                    (pos_masked[sim_mask]).cpu().numpy(),
+                    (n_photons_masked[sim_mask]).cpu().numpy(),
+                    (t_step_masked[sim_mask]).cpu().numpy(),
+                    (labels_masked[sim_mask]).cpu().numpy(),
+                    (pdgs_masked).cpu().numpy(),
+                    (de_masked).cpu().numpy(),
                 )
             return results
 
