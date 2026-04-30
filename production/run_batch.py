@@ -553,8 +553,8 @@ def main():
                     # Re-anchor t0 so t_goop_elapsed measures only goop_sim.simulate.
                     t0 = time.time()
                     waveforms = goop_sim.simulate(
-                        pos_mm, n_ph, t_ns, labels=labels, pdgs=pdgs, de=des,
-                        stitched=True, subtract_t0=True, return_tpc=False)
+                        pos_mm, n_ph, t_ns, labels=labels,
+                        stitched=True, subtract_t0=False if args.time_window_ns > 0 else True)
 
                     # 4.1 - Align Waveforms
                     if should_align:
