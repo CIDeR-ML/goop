@@ -47,7 +47,7 @@ from goop.noise import DarkNoise
 from goop.digitize import DigitizationConfig
 from goop.sampler import create_default_tof_sampler, create_siren_tof_sampler
 from goop.io import write_config_light, save_event_light, save_event_light_w_tpc
-from goop.utils import voxelize
+from goop.utils import voxelize, throw_in_time_window
 
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -156,7 +156,7 @@ def voxelize_labeled(pos_mm, n_photons, t_step_ns, labels, dx,
         mask = lbl == unique_lbl
         if not bool(mask.any()):
             continue
-        p_v, n_v, t_v = voxelize(pos[mask], nph[mask], tns[mask], dx=dx)
+        p_v, n_v, t_v = voxelize(pos[mask], nph[mask], tns[mask], lbl[mask], dx=dx)
         pv_all.append(p_v)
         npv_all.append(n_v)
         tv_all.append(t_v)
@@ -359,13 +359,25 @@ def main():
     warmup_filled = jaxtpc_sim.process_event_light(warmup_dep)
     jax.block_until_ready(warmup_filled.volumes[0].charge)
     pos, nph, tns, lbl, pdg, des, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
+    if args.time_window_ns > 0:
+        rand_time_tpcs_ns = throw_in_time_window(pos, nph, tns, lbl, time_window_ns=args.time_window_ns, pdgs=pdg, de=des)
+        pos = rand_time_tpcs_ns["pos_mm"]
+        nph = rand_time_tpcs_ns["n_photons"]
+        tns = rand_time_tpcs_ns["t_step"]
+        lbl = rand_time_tpcs_ns["labels"]
+        pdg = rand_time_tpcs_ns["pdgs"]
+        des = rand_time_tpcs_ns["de"]
     if args.voxel_dx > 0:
-        pos, nph, tns, lbl = voxelize_labeled(pos, nph, tns, lbl, args.voxel_dx)
-        pdg, des = None, None
-    warmup_wfs = goop_sim.simulate(
-        pos, nph, tns, labels=lbl, pdgs=pdg, de=des, stitched=True, subtract_t0=True, return_tpc=False
-    )
-    del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl, pdg, des
+        pos_vox, nph_vox, tns_vox, lbl_vox = voxelize_labeled(pos, nph, tns, lbl, args.voxel_dx)
+        warmup_wfs = goop_sim.simulate(
+            pos_vox, nph_vox, tns_vox, labels=lbl_vox, stitched=True, subtract_t0=False if args.time_window_ns > 0 else True
+        )
+        del warmup_dep, warmup_filled, warmup_wfs, pos, pos_vox, nph, nph_vox, tns, tns_vox, lbl, lbl_vox, pdg, des
+    else:
+        warmup_wfs = goop_sim.simulate(
+            pos, nph, tns, labels=lbl, stitched=True, subtract_t0=False if args.time_window_ns > 0 else True
+        )        
+        del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl, pdg, des
     gc.collect()
     torch.cuda.empty_cache()
     t_warmup = time.time() - t_warmup
@@ -503,22 +515,36 @@ def main():
                     pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = extract_goop_inputs(
                         filled, cfg, label_key)
                     n_after = total_segs
+                    if args.time_window_ns > 0:
+                        rand_time_tpcs_ns = throw_in_time_window(pos_mm, n_ph, t_ns, labels, time_window_ns=args.time_window_ns, pdgs=pdgs, de=des)
+                        pos_mm = rand_time_tpcs_ns["pos_mm"]
+                        n_ph = rand_time_tpcs_ns["n_photons"]
+                        t_ns = rand_time_tpcs_ns["t_step"]
+                        labels = rand_time_tpcs_ns["labels"]
+                        pdgs = rand_time_tpcs_ns["pdgs"]
+                        des = rand_time_tpcs_ns["de"]
+                        n_after = pos_mm.shape[0]
                     t_vox = 0.0
                     if args.voxel_dx > 0:
                         tv0 = time.time()
-                        pos_mm, n_ph, t_ns, labels = voxelize_labeled(
+                        pos_mm_vox, n_ph_vox, t_ns_vox, labels_vox = voxelize_labeled(
                             pos_mm, n_ph, t_ns, labels, args.voxel_dx,
                         )
                         # pdg/de are per-segment; drop them after voxelization
                         # since voxels merge segments with potentially different pdgs.
-                        pdgs, des = None, None
+                        pdgs_vox, des_vox = None, None
                         t_vox = time.time() - tv0
-                        n_after = pos_mm.shape[0]
+                        n_after = pos_mm_vox.shape[0]
                     # Re-anchor t0 so t_goop_elapsed measures only goop_sim.simulate.
                     t0 = time.time()
-                    waveforms, pos_new, n_ph_new, t_ns_new, labels_new, pdg_new, des_new = goop_sim.simulate(
-                        pos_mm, n_ph, t_ns, labels=labels, pdgs=pdgs, de=des,
-                        stitched=True, subtract_t0=True, return_tpc=True)
+                    if args.voxel_dx > 0:
+                        waveforms = goop_sim.simulate(
+                            pos_mm_vox, n_ph_vox, t_ns_vox, labels=labels_vox,
+                            stitched=True, subtract_t0=False if args.time_window_ns > 0 else True)
+                    else:
+                        waveforms = goop_sim.simulate(
+                            pos_mm, n_ph, t_ns, labels=labels,
+                            stitched=True, subtract_t0=False if args.time_window_ns > 0 else True)
 
                     # 4.1 - Align Waveforms
                     if should_align:
@@ -537,7 +563,17 @@ def main():
                     # 4. GPU → CPU transfer + save (serial or queued)
                     t0 = time.time()
                     waveforms_cpu = waveforms_to_cpu(waveforms)
-                    item = (event_key, waveforms_cpu, evt_idx, pos_new, n_ph_new, t_ns_new, labels_new, des_new, pdg_new)
+
+                    unique_labels = torch.unique(labels)
+                    sim_mask = torch.isin(labels, unique_labels)
+                    pos_new = pos_mm[sim_mask]
+                    n_ph_new = n_ph[sim_mask]
+                    t_ns_new = t_ns[sim_mask]
+                    labels_new = labels[sim_mask]
+                    pdg_new = pdgs[sim_mask]
+                    des_new = des[sim_mask]
+
+                    item = (event_key, waveforms_cpu, evt_idx, pos_new.cpu().numpy(), n_ph_new.cpu().numpy(), t_ns_new.cpu().numpy(), labels_new.cpu().numpy(), des_new.cpu().numpy(), pdg_new.cpu().numpy())
 
                     if num_workers > 0:
                         save_queue.put(item)
