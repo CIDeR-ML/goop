@@ -16,19 +16,273 @@ Required config
 
 from __future__ import annotations
 
+import math
 from typing import Any, List, Union
 
 import torch
+import torch.nn.functional as F
 
 from .digitize import digitize_ste
 from .simulator import OpticalSimConfig, OpticalSimulator
 from .waveform import SlicedWaveform, Waveform
+from .waveform_utils import _next_fft_size
 
 ArrayLike = Union[torch.Tensor, Any]
 
 # Padding constants for V2 sparse streaming time-grouping.
 _GAP_THRESHOLD_PAD_NS = 100.0  # safety margin so a gap-split can't bisect a kernel-extent tail
 _N_BINS_GROUP_PAD = 10         # extra bins so late photons aren't truncated by integer rounding
+
+
+class _HistConvFunction(torch.autograd.Function):
+    """Fused hard-bin scatter + FFT convolve, with smooth analytic backward.
+
+    Forward
+    -------
+        hist[c, k]  = scatter_add (weights, by floor(q_abs/tick - t0_ref), by pmt)
+        pred[c, t]  = gain · (hist ⋆ kernel)[c, t]   (FFT-based linear convolution)
+
+    Backward (custom — does NOT differentiate the floor cast)
+    ---------------------------------------------------------
+        grad_pred -> grad_pred_f via rFFT
+        grad_hist_f = grad_pred_f · conj(kernel_f)               # standard adjoint
+        score_f     = grad_pred_f · conj(kernel_deriv_f)         # = -2πi·f · grad_hist_f
+        Then irFFT and crop to (n_ch, n_bins).
+
+        For each saved (m, q) pair, evaluate `grad_hist` and `score` at the
+        continuous arrival time `q_abs[m, q]` via cubic B-spline interpolation
+        (4-tap, C^2 smooth).  This is what `weights[m, q]` and `q_abs[m, q]`
+        would have received if forward had soft-binned with a sinc-equivalent
+        kernel.
+
+        dL/d(weights[m,q]) =  gain · grad_hist( q_abs[m,q] )
+        dL/d(q_abs [m,q]) = -gain · weights[m,q] · score( q_abs[m,q] )
+
+    `pmt_idx`, `kernel_f`, `kernel_deriv_f`, and the bookkeeping scalars receive
+    no gradient (kernel_f / kernel_deriv_f are pre-computed and treated as
+    constants here).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_abs,            # (M, Q) float — autograd-live arrival times in ns
+        weights,          # (M, Q) float — autograd-live per-pair weights
+        pmt_idx,          # (M,)   long  — channel id per pair
+        kernel_f,         # ((n_fft//2)+1,) complex — pre-computed rfft of kernel
+        kernel_deriv_f,   # same shape — i·2π·f · kernel_f
+        t0_ref,           # python float
+        tick_ns,          # python float
+        n_bins,           # python int — histogram length
+        n_ch,             # python int
+        gain,             # python float
+        kernel_extent_bins,  # python int — kernel.shape[0]
+    ):
+        device = q_abs.device
+        n_fft = (kernel_f.shape[0] - 1) * 2
+
+        # Hard-bin scatter into a fresh histogram.
+        bin_idx = ((q_abs.detach() - t0_ref) / tick_ns).floor().long()  # (M, Q)
+        in_w = (bin_idx >= 0) & (bin_idx < n_bins)
+        bin_idx_c = bin_idx.clamp(0, n_bins - 1)
+        flat_idx = pmt_idx.unsqueeze(-1) * n_bins + bin_idx_c           # (M, Q)
+        w_in = (weights.detach() * in_w).reshape(-1)
+        hist = torch.zeros(n_ch, n_bins, device=device, dtype=torch.float32)
+        hist.view(-1).scatter_add_(0, flat_idx.reshape(-1), w_in)
+
+        # FFT convolve hist with kernel.
+        padded = F.pad(hist, (0, n_fft - n_bins))
+        hist_f = torch.fft.rfft(padded, dim=-1)
+        pred_f = hist_f * kernel_f.unsqueeze(0)
+        out_len = n_bins + kernel_extent_bins - 1
+        pred = gain * torch.fft.irfft(pred_f, n=n_fft, dim=-1)[:, :out_len]
+
+        ctx.save_for_backward(q_abs, weights, pmt_idx, kernel_f, kernel_deriv_f)
+        ctx.t0_ref = t0_ref
+        ctx.tick_ns = tick_ns
+        ctx.n_bins = n_bins
+        ctx.n_ch = n_ch
+        ctx.gain = gain
+        ctx.n_fft = n_fft
+        ctx.out_len = out_len
+        return pred
+
+    @staticmethod
+    def backward(ctx, grad_pred):
+        q_abs, weights, pmt_idx, kernel_f, kernel_deriv_f = ctx.saved_tensors
+        t0_ref, tick_ns = ctx.t0_ref, ctx.tick_ns
+        n_bins, n_ch, gain = ctx.n_bins, ctx.n_ch, ctx.gain
+        n_fft, out_len = ctx.n_fft, ctx.out_len
+        device = grad_pred.device
+
+        # Pad upstream gradient and rFFT.
+        grad_pred_padded = F.pad(grad_pred, (0, n_fft - out_len))
+        grad_pred_f = torch.fft.rfft(grad_pred_padded, dim=-1)
+
+        # Two adjoint convolutions in Fourier — share the same FFT of grad_pred.
+        grad_hist_f = grad_pred_f * kernel_f.conj().unsqueeze(0)
+        score_f     = grad_pred_f * kernel_deriv_f.conj().unsqueeze(0)
+        grad_hist = torch.fft.irfft(grad_hist_f, n=n_fft, dim=-1)[:, :n_bins]
+        score     = torch.fft.irfft(score_f,     n=n_fft, dim=-1)[:, :n_bins]
+
+        # Cubic B-spline weights at each pair's fractional bin offset.
+        q_abs_d = q_abs.detach()
+        frac    = (q_abs_d - t0_ref) / tick_ns
+        bin_lo  = frac.floor().long()                       # (M, Q)
+        f       = frac - bin_lo                              # (M, Q) ∈ [0, 1)
+        omf     = 1.0 - f
+        inv6    = 1.0 / 6.0
+        bw_m1   = inv6 * omf.pow(3)
+        bw_0    = inv6 * (4.0 - 6.0 * f.pow(2)   + 3.0 * f.pow(3))
+        bw_p1   = inv6 * (4.0 - 6.0 * omf.pow(2) + 3.0 * omf.pow(3))
+        bw_p2   = inv6 * f.pow(3)
+
+        M, Q = q_abs.shape
+        pmt_expand = pmt_idx.unsqueeze(-1).expand(M, Q)
+
+        def gather_4tap(arr):
+            """Gather arr[pmt[m], bin_lo[m,q] + k] · B-spline weight for k=−1..2."""
+            res = torch.zeros((M, Q), device=device, dtype=arr.dtype)
+            for shift, w in ((-1, bw_m1), (0, bw_0), (1, bw_p1), (2, bw_p2)):
+                bin_idx_k = bin_lo + shift
+                in_window = (bin_idx_k >= 0) & (bin_idx_k < n_bins)
+                bin_idx_kc = bin_idx_k.clamp(0, n_bins - 1)
+                vals = arr[pmt_expand, bin_idx_kc] * in_window
+                res = res + vals * w
+            return res
+
+        grad_hist_at_q = gather_4tap(grad_hist)              # (M, Q)
+        score_at_q     = gather_4tap(score)                  # (M, Q)
+
+        grad_q_abs   = -gain * weights.detach() * score_at_q
+        grad_weights =  gain * grad_hist_at_q
+
+        # Order matches forward signature: only q_abs and weights receive grad.
+        return grad_q_abs, grad_weights, None, None, None, None, None, None, None, None, None
+
+
+def histogram_and_convolve_pdf(
+    sampler,
+    pos: torch.Tensor,
+    n_photons: torch.Tensor,
+    t_step: torch.Tensor,
+    *,
+    tick_ns: float,
+    n_bins: int,
+    t0_ref: float,
+    kernel_tensor: torch.Tensor,
+    gain: float,
+    chunk_size: int = 5000,
+    expected_eps: float = 1e-9,
+    q_stride=None,
+):
+    """Differentiable forward producing the gain-scaled per-PMT *convolved*
+    waveform, with autograd-clean gradients to ``pos``, ``n_photons``, and
+    ``t_step`` via ``_HistConvFunction``.
+
+    Equivalent to ``Waveform(adc=histogram_pdf(..)).convolve(kernel, gain)``
+    in expectation, but the gradient is C^2 smooth in continuous photon
+    arrival time (no kink at integer-tick boundaries).
+
+    Returns a ``(pred, total_pe)`` tuple.  ``pred`` is shape
+    ``(n_ch, n_bins + len(kernel) - 1)``, autograd-live.
+
+    Samplers that don't expose ``_emit_chunk`` (e.g. mock samplers used in tests)
+    transparently fall back to the legacy ``histogram_pdf`` + ``Waveform.convolve``
+    path, which has the same forward behaviour but kink-y per-tick gradients in
+    ``t_step``.
+    """
+    if not hasattr(sampler, "_emit_chunk"):
+        # Legacy fallback for non-PCA samplers (no per-source `_emit_chunk`).
+        hist = sampler.histogram_pdf(
+            pos, n_photons, t_step,
+            tick_ns=tick_ns, n_bins=n_bins, t0_ref=t0_ref,
+            chunk_size=chunk_size,
+        )
+        device_h = hist.device
+        wf = Waveform(adc=hist, t0=t0_ref, tick_ns=tick_ns,
+                      n_channels=hist.shape[0])
+        wf = wf.convolve(kernel_tensor, gain)
+        total_pe_legacy = hist.sum(dim=1)
+        return wf.adc, total_pe_legacy
+
+    device = sampler._device
+    n_ch = 2 * sampler._n_pmts
+    K = kernel_tensor.shape[0]
+    out_len = n_bins + K - 1
+    n_fft = _next_fft_size(out_len)
+
+    # Pre-compute kernel_f + kernel_deriv_f once (treated as constants by autograd).
+    with torch.no_grad():
+        kernel_padded = F.pad(kernel_tensor, (0, n_fft - K))
+        kernel_f = torch.fft.rfft(kernel_padded, n=n_fft)
+        # Angular frequency vector for d/dt: kernel_deriv_f = i·2π·f · kernel_f.
+        freqs = torch.fft.rfftfreq(n_fft, d=tick_ns).to(device=device)
+        kernel_deriv_f = (1j * 2.0 * math.pi * freqs) * kernel_f
+
+    # Normalize input shapes (mirrors PCATOFSampler.histogram_pdf preamble).
+    pos = pos if isinstance(pos, torch.Tensor) else torch.as_tensor(pos)
+    pos = pos.to(dtype=torch.float32, device=device)
+    if pos.dim() == 1:
+        pos = pos.unsqueeze(0)
+    N = pos.shape[0]
+
+    if isinstance(n_photons, (int, float)):
+        scale = torch.full((N,), float(n_photons) / sampler.n_simulated, device=device)
+    else:
+        n_ph_t = n_photons if isinstance(n_photons, torch.Tensor) else torch.as_tensor(n_photons)
+        scale = n_ph_t.to(dtype=torch.float32, device=device) / sampler.n_simulated
+
+    if t_step is None:
+        t_step_t = torch.zeros(N, device=device, dtype=torch.float32)
+    else:
+        t_step_t = t_step if isinstance(t_step, torch.Tensor) else torch.as_tensor(t_step)
+        t_step_t = t_step_t.to(dtype=torch.float32, device=device)
+
+    q_idx, du_eff = sampler._resolve_q_stride(q_stride)
+
+    # Iterate position chunks; collect autograd-live (q_abs, weights, pmt_idx).
+    all_q_abs, all_weights, all_pmt = [], [], []
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        emit = sampler._emit_chunk(
+            pos_chunk=pos[start:end],
+            scale_chunk=scale[start:end],
+            tns_chunk=t_step_t[start:end],
+            du_eff=du_eff, q_idx=q_idx, expected_eps=expected_eps,
+        )
+        if emit is None:
+            continue
+        q_abs_c, pmt_c, weights_c = emit
+        all_q_abs.append(q_abs_c)
+        all_weights.append(weights_c)
+        all_pmt.append(pmt_c)
+
+    if not all_q_abs:
+        empty_pred = torch.zeros(n_ch, out_len, device=device, dtype=torch.float32)
+        empty_pe = torch.zeros(n_ch, device=device, dtype=torch.float32)
+        return empty_pred, empty_pe
+
+    q_abs = torch.cat(all_q_abs, dim=0)
+    weights = torch.cat(all_weights, dim=0)
+    pmt_idx = torch.cat(all_pmt, dim=0)
+
+    pred = _HistConvFunction.apply(
+        q_abs, weights, pmt_idx,
+        kernel_f, kernel_deriv_f,
+        float(t0_ref), float(tick_ns),
+        int(n_bins), int(n_ch), float(gain), int(K),
+    )
+
+    # total_pe per PMT: sum of in-window weights. Autograd-live through
+    # `weights` (so n_photons / pos gradients flow into pe_counts), but the
+    # integer in-window mask is detached.
+    bin_idx_pe = ((q_abs.detach() - t0_ref) / tick_ns).floor().long()
+    in_w_pe = (bin_idx_pe >= 0) & (bin_idx_pe < n_bins)
+    per_pair = (weights * in_w_pe).sum(dim=-1)
+    total_pe = torch.zeros(n_ch, device=device, dtype=torch.float32)
+    total_pe = total_pe.scatter_add(0, pmt_idx, per_pair)
+    return pred, total_pe
 
 
 def time_group_segments(
@@ -166,15 +420,11 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
             t0_g = float(t0_starts_cpu[gi])
             n_bins_g = int(n_bins_cpu[gi])
 
-            hist_g = sampler.histogram_pdf(
-                pos[g_idx], n_photons[g_idx], t_g,
-                tick_ns=fine_tick, n_bins=n_bins_g, t0_ref=t0_g,
-                chunk_size=cfg.stream_chunk_size,
-                use_checkpoint=cfg.stream_checkpoint,
-            )
-            total_pe = total_pe + hist_g.sum(dim=1)
-
-            # Inject aux photon sources for this group's time window.
+            # Aux photons for this group's time window — added to the histogram
+            # before convolution. We materialise them as a small dense tensor
+            # of shape (n_ch, n_bins_g) so we can fold them into the convolved
+            # output by convolving separately and adding (linearity of FFT).
+            aux_hist_g = None
             if cfg.aux_photon_sources:
                 t_start_g = t0_g
                 t_end_g = t0_g + n_bins_g * fine_tick
@@ -183,15 +433,39 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
                     if aux_t.numel() == 0:
                         continue
                     aux_bin = ((aux_t - t0_g) / fine_tick).long().clamp(0, n_bins_g - 1)
+                    if aux_hist_g is None:
+                        aux_hist_g = torch.zeros(
+                            n_ch, n_bins_g, device=device, dtype=torch.float32,
+                        )
                     aux_flat = aux_ch.long() * n_bins_g + aux_bin
-                    hist_g = hist_g.reshape(-1).scatter_add(
-                        0, aux_flat, torch.ones_like(aux_t, dtype=hist_g.dtype)
-                    ).reshape(n_ch, n_bins_g)
+                    aux_hist_g.view(-1).scatter_add_(
+                        0, aux_flat, torch.ones_like(aux_t, dtype=aux_hist_g.dtype),
+                    )
+
+            # Forward via the option-3 fused custom Function: smooth gradient
+            # in t_step (and pos / n_photons) at sub-tick resolution without
+            # ever differentiating through the floor cast.
+            pred_g, total_pe_g = histogram_and_convolve_pdf(
+                sampler,
+                pos[g_idx], n_photons[g_idx], t_g,
+                tick_ns=fine_tick, n_bins=n_bins_g, t0_ref=t0_g,
+                kernel_tensor=fine_kernel_tensor,
+                gain=cfg.gain,
+                chunk_size=cfg.stream_chunk_size,
+            )
+
+            if aux_hist_g is not None:
+                aux_wf = Waveform(
+                    adc=aux_hist_g, t0=t0_g, tick_ns=fine_tick, n_channels=n_ch,
+                ).convolve(fine_kernel_tensor, cfg.gain)
+                pred_g = pred_g + aux_wf.adc
+                total_pe_g = total_pe_g + aux_hist_g.sum(dim=1)
+
+            total_pe = total_pe + total_pe_g
 
             wf_g = Waveform(
-                adc=hist_g, t0=t0_g, tick_ns=fine_tick, n_channels=n_ch,
+                adc=pred_g, t0=t0_g, tick_ns=fine_tick, n_channels=n_ch,
             )
-            wf_g = wf_g.convolve(fine_kernel_tensor, cfg.gain)
             if cfg.oversample > 1:
                 wf_g = wf_g.downsample(cfg.oversample)
 
