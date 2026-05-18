@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, List
 
 import numpy as np
@@ -24,6 +25,11 @@ def write_config_light(
     dataset_name: str = "",
     file_index: int = 0,
     source_file: str = "",
+    pca_lut_path: str = "",
+    sampler_type: str = "",
+    sampler_config: dict | None = None,
+    delay_chain: list | None = None,
+    aux_photon_sources: list | None = None,
     n_events: int = 0,
     global_event_offset: int = 0,
 ) -> None:
@@ -60,6 +66,11 @@ def write_config_light(
     a["dataset_name"] = dataset_name
     a["file_index"] = file_index
     a["source_file"] = source_file
+    a["pca_lut_path"] = pca_lut_path
+    a["sampler_type"] = sampler_type
+    a["sampler_config"] = json.dumps(sampler_config or {}, sort_keys=True)
+    a["delay_chain"] = json.dumps(delay_chain or [], sort_keys=True)
+    a["aux_photon_sources"] = json.dumps(aux_photon_sources or [], sort_keys=True)
     a["n_events"] = n_events
     a["global_event_offset"] = global_event_offset
 

@@ -1,6 +1,14 @@
 """Optical TPC simulation pipeline package."""
 
 from .base import ConvolutionKernelBase, DelaySamplerBase, PhotonSourceBase, TOFSamplerBase
+from .config import (
+    build_aux_photon_sources,
+    build_delay_chain,
+    build_optical_config,
+    build_tof_sampler,
+    load_run_config,
+    normalize_run_config,
+)
 from .delays import (
     Delays,
     ScintillationBiexponentialDelay,
@@ -39,6 +47,12 @@ __all__ = [
     "DelaySamplerBase",
     "PhotonSourceBase",
     "TOFSamplerBase",
+    "load_run_config",
+    "normalize_run_config",
+    "build_tof_sampler",
+    "build_delay_chain",
+    "build_aux_photon_sources",
+    "build_optical_config",
     "OpticalSimConfig",
     "ScintillationBiexponentialDelay",
     "TPBExponentialDelay",

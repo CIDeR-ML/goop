@@ -19,6 +19,9 @@ From the project root:
 # Basic run (5 events, digitization on)
 python3 production/run_batch.py --data events.h5 --events 5
 
+# YAML run config; CLI flags can still override individual settings
+python3 production/run_batch.py --run-config production/configs/out_full_prod.yml
+
 # Full options
 python3 production/run_batch.py \
     --data mpvmpr_20.h5 \
@@ -37,6 +40,7 @@ python3 production/run_batch.py \
 
 | Flag | Default | Description |
 |---|---|---|
+| `--run-config`, `--run-yml`, `--run-yaml` | unset | YAML file containing run defaults. CLI flags override values loaded from the file. |
 | `--data` | `out.h5` | Input HDF5 file (edep-sim output) |
 | `--config` | `jaxtpc/config/cubic_wireplane_config.yaml` | Detector geometry YAML |
 | `--dataset` | `sim` | Dataset name prefix for output files |
@@ -57,12 +61,72 @@ python3 production/run_batch.py \
 | `--total-pad` | 250,000 | Max deposits per side (jaxtpc JIT shape) |
 | `--response-chunk-size` | 50,000 | jaxtpc response chunk size |
 | `--sampler` | `lut` | TOF sampler backend: `lut` (eager voxel LUT) or `siren` (SIREN neural net) |
+| `--pca-lut-path`, `--plib-path` | `/sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5` | PCA photon-library HDF5 used by the LUT sampler, and as the PCA basis for SIREN |
+| `--pmt-qe` | 0.12 | PMT quantum efficiency passed to the TOF sampler |
+| `--lut-n-simulated` | 15,000,000 | Number of simulated photons represented by the PCA LUT |
+| `--sampler-device` | `cuda:0` | Device string passed to the TOF sampler |
+| `--sampler-lazy` / `--no-sampler-lazy` | eager | Toggle lazy HDF5-backed LUT access |
+| `--sampler-interpolate` / `--no-sampler-interpolate` | interpolate | Toggle LUT interpolation |
 | `--voxel-dx` | 0.0 | Voxelize input segments to a cubic grid of side length `dx` (mm) before goop simulate, performed per-label group. `0` disables. |
 | `--workers` | 2 | Number of save worker threads (0 = serial) |
 | `--seed` | 42 | Random seed |
 | `--align` | off | Align chunks when returning `List[SlicedWaveform]` |
 | `--time-window-ns` | 10000 | Time window to mimic the beam window |
 | `--label-dist` | Uniform | [Uniform, Poisson, HalfNormal] Type of distribution to sample N interactions |
+
+### YAML Run Configs
+
+Run configs are nested by subsystem. Components use an explicit `type` field,
+and every sibling key is passed to that component constructor as a kwarg. Omit
+`aux_photon_sources`, or set it to `[]`, for no dark noise or other auxiliary
+photon sources.
+
+```yaml
+sampler:
+  type: lut
+  plib_path: /sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5
+  pmt_qe: 0.12
+  n_simulated: 15000000
+  lazy: false
+  interpolate: true
+  device: cuda:0
+
+delays:
+  enabled: true
+  chain:
+    - type: ScintillationBiexponentialDelay
+      singlet_fraction: 0.3
+      tau_singlet_ns: 6.0
+      tau_triplet_ns: 1300.0
+    - type: TPBTriexponentialDelay
+    - type: TTSDelay
+      fwhm_ns: 2.4
+      apply_transit_time: true
+
+aux_photon_sources:
+  - type: DarkNoise
+    rate_hz: 2000.0
+```
+
+Flat legacy keys are still accepted. For example, `pca_lut_path` / `plib_path`
+map to `sampler.plib_path`, and `dark_noise: true` with `dark_noise_rate` maps
+to a `DarkNoise` aux source.
+
+`production/configs/out_full_prod.yml` is set up for a full production run over
+all events in `/sdf/home/y/youngsam/sw/dune/sirentv/data/out.h5`:
+
+```bash
+python3 production/run_batch.py --run-config production/configs/out_full_prod.yml
+```
+
+To change one value for a specific invocation, add the normal CLI flag:
+
+```bash
+python3 production/run_batch.py \
+    --run-config production/configs/out_full_prod.yml \
+    --events 10 \
+    --dataset debug_10
+```
 
 ## Pipeline
 
@@ -247,3 +311,11 @@ A voxel size of 10 mm is around the maximum voxel size you can use before seeing
 
 If running into OOM issues when using the non-lazy LUT, switch to using Siren as the sampler (`--sampler siren`); set the voxelization to 10 mm (`--voxel-dx 10`), otherwise there will be a bottleneck due to the number of Siren evaluations scaling with the number of input segments.
 
+When `--voxel-dx > 0`, the simulator runs on the voxelized point cloud but the **TPC arrays saved to HDF5 (`tpc_positions`, `tpc_n_photons`, `tpc_t_step`, `tpc_pdg`, `tpc_de`, `tpc_labels` inside each `event_NNN/label_K/`) are at the original per-segment granularity** — voxelization is purely a simulator-input optimisation, not a truth-data reduction.
+
+## Tests
+
+```bash
+# Smoke + import check. GPU is needed.
+pytest tests/test_run_batch_smoke.py -v
+```

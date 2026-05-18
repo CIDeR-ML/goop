@@ -67,6 +67,52 @@ def test_imports():
     assert hasattr(module, "HalfNormal")
 
 
+def test_run_config_yaml_defaults(tmp_path):
+    """YAML run configs should populate argparse defaults and remain overrideable."""
+    spec = importlib.util.spec_from_file_location("run_batch_smoke_mod", str(RUN_BATCH))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    run_config = tmp_path / "run.yml"
+    run_config.write_text(
+        "\n".join([
+            "data: /tmp/input.h5",
+            "detector_config: jaxtpc/config/cubic_wireplane_config.yaml",
+            "dataset: yaml_dataset",
+            "outdir: /tmp/out",
+            "events: null",
+            "events_per_file: 7",
+            "digitize: false",
+            "dark_noise: true",
+            "align: true",
+            "plib_path: /tmp/plib.h5",
+            "voxel_dx: 10.0",
+        ]),
+        encoding="utf-8",
+    )
+
+    args = module.parse_args([
+        "--run-config", str(run_config),
+        "--events", "3",
+        "--digitize",
+        "--no-dark-noise",
+        "--no-align",
+    ])
+
+    assert args.run_config == str(run_config)
+    assert args.data == "/tmp/input.h5"
+    assert args.config == "jaxtpc/config/cubic_wireplane_config.yaml"
+    assert args.dataset == "yaml_dataset"
+    assert args.events == 3
+    assert args.events_per_file == 7
+    assert args.no_digitize is False
+    assert args.dark_noise is False
+    assert args.align is False
+    assert args.pca_lut_path == "/tmp/plib.h5"
+    assert args.voxel_dx == 10.0
+
+
 @pytest.mark.skipif(
     shutil.which("python") is None,
     reason="No python available for subprocess smoke",

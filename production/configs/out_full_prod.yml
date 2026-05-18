@@ -1,0 +1,63 @@
+# Full GOOP production run over every event in the SIREN TV out.h5 file.
+# Launch with:
+#   python3 production/run_batch.py --run-config production/configs/out_full_prod.yml
+
+run:
+  data: /sdf/home/y/youngsam/sw/dune/sirentv/data/out.h5
+  # null means "all events" (the input currently contains 1000 events).
+  events: null
+  events_per_file: 1000
+  label_key: interaction
+  label_dist: Uniform
+  seed: 42
+  align: false
+
+detector:
+  config: jaxtpc/config/cubic_wireplane_config.yaml
+  total_pad: 250000
+  response_chunk_size: 50000
+
+output:
+  dataset: out_full_prod
+  outdir: /sdf/group/neutrino/youngsam/sim/goop/prod_runs/out_full_prod
+  workers: 2
+
+digitization:
+  enabled: true
+  n_bits: 15
+  pedestal: null
+  max_pe_per_pmt: 90000
+
+optical:
+  device: cuda
+  tick_ns: 1.0
+  oversample: 10
+  voxel_dx: 10.0
+  time_window_ns: 10000
+  ser_jitter_std: 0.1
+  baseline_noise_std: 0.0
+  kernel_duration_ns: 10000
+
+sampler:
+  type: lut
+  plib_path: /sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5
+  pmt_qe: 0.12
+  n_simulated: 15000000
+  lazy: false
+  interpolate: true
+  device: cuda:0
+
+delays:
+  enabled: true
+  chain:
+    - type: ScintillationBiexponentialDelay
+      singlet_fraction: 0.3
+      tau_singlet_ns: 6.0
+      tau_triplet_ns: 1300.0
+    - type: TPBTriexponentialDelay
+    - type: TTSDelay
+      fwhm_ns: 2.4
+      apply_transit_time: true
+
+# Omit this key, or leave it empty, for no dark noise / aux photon sources.
+aux_photon_sources: []

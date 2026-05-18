@@ -10,11 +10,13 @@ Usage (from project root):
     python3 production/run_batch.py --data events.h5
     python3 production/run_batch.py --data events.h5 --dataset mpvmpr --events 100
     python3 production/run_batch.py --data events.h5 --events 1000 --events-per-file 100
+    python3 production/run_batch.py --run-config production/configs/out_full_prod.yml
 """
 
 import argparse
 import concurrent.futures
 import gc
+import json
 import os
 import queue
 import sys
@@ -40,12 +42,18 @@ from tools.geometry import generate_detector
 from tools.simulation import DetectorSimulator
 from tools.loader import load_event
 
-from goop import OpticalSimConfig, OpticalSimulator
-from goop.kernels import SERKernel
-from goop.delays import ScintillationBiexponentialDelay, TPBTriexponentialDelay, TTSDelay
-from goop.noise import DarkNoise
-from goop.digitize import DigitizationConfig
-from goop.sampler import create_default_tof_sampler, create_siren_tof_sampler
+from goop import OpticalSimulator
+from goop.config import (
+    apply_flat_overrides,
+    aux_photon_sources_config,
+    build_optical_config,
+    delay_chain_config,
+    flatten_config_for_argparse,
+    load_run_config,
+    pca_lut_path,
+    resolve_digitization,
+    sampler_config,
+)
 from goop.io import write_config_light, save_event_light, save_event_light_w_tpc
 from goop.utils import voxelize, throw_in_time_window
 
@@ -170,84 +178,245 @@ def voxelize_labeled(pos_mm, n_photons, t_step_ns, labels, dx,
             torch.cat(lbl_all))
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+def _as_numpy(x):
+    """Convert tensor/array-like values to host numpy arrays for HDF5 writes."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
-def main():
+
+def build_parser(defaults=None):
+    defaults = defaults or {}
     parser = argparse.ArgumentParser(
         description='Batch optical simulation (jaxtpc -> GOOP)')
+    parser.add_argument('--run-config', '--run-yml', '--run-yaml',
+                        default=None,
+                        help='YAML file with defaults for this run. CLI flags '
+                             'override values from the file.')
     # I/O
-    parser.add_argument('--data', default='out.h5', help='Input HDF5 file')
-    parser.add_argument('--config', default='jaxtpc/config/cubic_wireplane_config.yaml',
+    parser.add_argument('--data', default=defaults['data'], help='Input HDF5 file')
+    parser.add_argument('--config', default=defaults['config'],
                         help='Detector geometry YAML')
-    parser.add_argument('--dataset', default='sim',
+    parser.add_argument('--dataset', default=defaults['dataset'],
                         help='Dataset name prefix for output files')
-    parser.add_argument('--outdir', default='.', help='Output directory')
-    parser.add_argument('--events', type=int, default=None,
+    parser.add_argument('--outdir', default=defaults['outdir'], help='Output directory')
+    parser.add_argument('--events', type=int, default=defaults['events'],
                         help='Number of events (default: all)')
-    parser.add_argument('--events-per-file', type=int, default=1000,
+    parser.add_argument('--events-per-file', type=int,
+                        default=defaults['events_per_file'],
                         help='Events per output file (default: 1000)')
-    parser.add_argument('--label-key', default='interaction',
+    parser.add_argument('--label-key', default=defaults['label_key'],
                         choices=list(LABEL_FIELDS.keys()),
                         help='Deposit label for per-waveform separation '
                              '(default: interaction)')
-    parser.add_argument('--label-dist', default='Uniform',
+    parser.add_argument('--label-dist', default=defaults['label_dist'],
                         choices=['Uniform', 'Poisson', 'HalfNormal', 'Fixed'],
                         help='Distribution for label sampling (default: Uniform)')
     # Digitization
-    parser.add_argument('--n-bits', type=int, default=15,
+    parser.add_argument('--n-bits', type=int, default=defaults['n_bits'],
                         help='ADC bit depth (default: 15)')
-    parser.add_argument('--pedestal', type=float, default=None,
+    parser.add_argument('--pedestal', type=float, default=defaults['pedestal'],
                         help='ADC pedestal (default: 0.9 * (2^n_bits - 1))')
-    parser.add_argument('--max-pe-per-pmt', type=float, default=90_000,
+    parser.add_argument('--max-pe-per-pmt', type=float,
+                        default=defaults['max_pe_per_pmt'],
                         help='PE scale for gain calculation (default: 90000)')
-    parser.add_argument('--no-digitize', action='store_true',
+    parser.add_argument('--no-digitize', dest='no_digitize',
+                        action='store_true', default=defaults['no_digitize'],
                         help='Disable ADC digitization')
+    parser.add_argument('--digitize', dest='no_digitize',
+                        action='store_false',
+                        help='Enable ADC digitization, overriding a YAML no_digitize setting')
     # Physics
-    parser.add_argument('--dark-noise', action='store_true',
+    parser.add_argument('--dark-noise', dest='dark_noise',
+                        action='store_true', default=defaults['dark_noise'],
                         help='Enable dark noise')
-    parser.add_argument('--dark-noise-rate', type=float, default=2000.0,
+    parser.add_argument('--no-dark-noise', dest='dark_noise',
+                        action='store_false',
+                        help='Disable dark noise, overriding a YAML dark_noise setting')
+    parser.add_argument('--dark-noise-rate', type=float,
+                        default=defaults['dark_noise_rate'],
                         help='Dark noise rate in Hz (default: 2000)')
-    parser.add_argument('--baseline-noise-std', type=float, default=0.0,
+    parser.add_argument('--baseline-noise-std', type=float,
+                        default=defaults['baseline_noise_std'],
                         help='Gaussian baseline noise std (default: 0.0)')
-    parser.add_argument('--ser-jitter-std', type=float, default=0.1,
+    parser.add_argument('--ser-jitter-std', type=float,
+                        default=defaults['ser_jitter_std'],
                         help='SER jitter std (default: 0.1)')
-    parser.add_argument('--time-window-ns', type=int, default=10000,
+    parser.add_argument('--time-window-ns', type=int,
+                        default=defaults['time_window_ns'],
                         help='Time window for GOOP simulation in ns (default: 10000)')
 
     # Timing / oversampling
-    parser.add_argument('--tick-ns', type=float, default=1.0,
+    parser.add_argument('--tick-ns', type=float, default=defaults['tick_ns'],
                         help='Output time bin width in ns (default: 1.0)')
-    parser.add_argument('--oversample', type=int, default=10,
+    parser.add_argument('--oversample', type=int, default=defaults['oversample'],
                         help='Internal oversampling factor (default: 10)')
     # jaxtpc
-    parser.add_argument('--total-pad', type=int, default=250_000,
+    parser.add_argument('--total-pad', type=int, default=defaults['total_pad'],
                         help='Padding for segment arrays (default: 250000)')
-    parser.add_argument('--response-chunk-size', type=int, default=50_000,
+    parser.add_argument('--response-chunk-size', type=int,
+                        default=defaults['response_chunk_size'],
                         help='jaxtpc response chunk size (default: 50000)')
     # Sampler
-    parser.add_argument('--sampler', choices=['lut', 'siren'], default='lut',
+    parser.add_argument('--sampler', choices=['lut', 'siren'],
+                        default=defaults['sampler'],
                         help='TOF sampler backend: lut (voxel LUT, eager) or '
                              'siren (SIREN neural network); default: lut')
+    parser.add_argument('--pca-lut-path', '--plib-path',
+                        default=defaults['pca_lut_path'],
+                        help='PCA photon-library HDF5 path used by the LUT '
+                             'sampler, and as the PCA basis for the SIREN sampler')
+    parser.add_argument('--pmt-qe', type=float, default=defaults.get('pmt_qe'),
+                        help='Sampler PMT quantum efficiency passed to the TOF sampler')
+    parser.add_argument('--lut-n-simulated', type=float,
+                        default=defaults.get('lut_n_simulated'),
+                        help='Number of simulated photons represented by the PCA LUT')
+    parser.add_argument('--sampler-device', default=defaults.get('sampler_device'),
+                        help='Device string passed to the TOF sampler')
+    parser.add_argument('--sampler-lazy', dest='sampler_lazy',
+                        action='store_true', default=defaults.get('sampler_lazy'),
+                        help='Use lazy HDF5-backed LUT access instead of eager GPU load')
+    parser.add_argument('--no-sampler-lazy', dest='sampler_lazy',
+                        action='store_false',
+                        help='Use eager LUT loading, overriding YAML sampler.lazy')
+    parser.add_argument('--sampler-interpolate', dest='sampler_interpolate',
+                        action='store_true', default=defaults.get('sampler_interpolate'),
+                        help='Enable sampler interpolation')
+    parser.add_argument('--no-sampler-interpolate', dest='sampler_interpolate',
+                        action='store_false',
+                        help='Disable sampler interpolation, overriding YAML sampler.interpolate')
+    parser.add_argument('--siren-ckpt-path', default=defaults.get('siren_ckpt_path'),
+                        help='SIREN checkpoint path passed to the SIREN sampler')
+    parser.add_argument('--siren-cfg-path', default=defaults.get('siren_cfg_path'),
+                        help='SIREN train config path passed to the SIREN sampler')
+    parser.add_argument('--sirentv-src', default=defaults.get('sirentv_src'),
+                        help='sirentv source tree path passed to the SIREN sampler')
     # Voxelization
-    parser.add_argument('--voxel-dx', type=float, default=0.0,
+    parser.add_argument('--voxel-dx', type=float, default=defaults['voxel_dx'],
                         help='Voxelize input segments to a cubic grid of side '
                              'length dx (mm) before goop simulate. Voxelization '
                              'is performed per-label group so per-waveform label '
                              'separation is preserved. 0 disables (default).')
     # Other
-    parser.add_argument('--workers', type=int, default=2,
+    parser.add_argument('--workers', type=int, default=defaults['workers'],
                         help='Number of save worker threads (0=serial, default: 2)')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--align', action='store_true', help='Requires subtract_t0=True in goop_sim.simulate()')
+    parser.add_argument('--seed', type=int, default=defaults['seed'])
+    parser.add_argument('--align', dest='align',
+                        action='store_true', default=defaults['align'],
+                        help='Requires subtract_t0=True in goop_sim.simulate()')
+    parser.add_argument('--no-align', dest='align',
+                        action='store_false',
+                        help='Disable waveform alignment, overriding a YAML align setting')
+    return parser
 
-    args = parser.parse_args()
 
-    include_digitize = not args.no_digitize
-    n_bits = args.n_bits
-    pedestal = args.pedestal if args.pedestal is not None else 0.9 * ((1 << n_bits) - 1)
-    gain = (2 ** n_bits) / args.max_pe_per_pmt
+CLI_OVERRIDE_SPECS = [
+    ('data', 'data', ['--data']),
+    ('config', 'config', ['--config']),
+    ('dataset', 'dataset', ['--dataset']),
+    ('outdir', 'outdir', ['--outdir']),
+    ('events', 'events', ['--events']),
+    ('events_per_file', 'events_per_file', ['--events-per-file']),
+    ('label_key', 'label_key', ['--label-key']),
+    ('label_dist', 'label_dist', ['--label-dist']),
+    ('n_bits', 'n_bits', ['--n-bits']),
+    ('pedestal', 'pedestal', ['--pedestal']),
+    ('max_pe_per_pmt', 'max_pe_per_pmt', ['--max-pe-per-pmt']),
+    ('dark_noise_rate', 'dark_noise_rate', ['--dark-noise-rate']),
+    ('baseline_noise_std', 'baseline_noise_std', ['--baseline-noise-std']),
+    ('ser_jitter_std', 'ser_jitter_std', ['--ser-jitter-std']),
+    ('time_window_ns', 'time_window_ns', ['--time-window-ns']),
+    ('tick_ns', 'tick_ns', ['--tick-ns']),
+    ('oversample', 'oversample', ['--oversample']),
+    ('total_pad', 'total_pad', ['--total-pad']),
+    ('response_chunk_size', 'response_chunk_size', ['--response-chunk-size']),
+    ('sampler', 'sampler', ['--sampler']),
+    ('pca_lut_path', 'pca_lut_path', ['--pca-lut-path', '--plib-path']),
+    ('pmt_qe', 'pmt_qe', ['--pmt-qe']),
+    ('lut_n_simulated', 'lut_n_simulated', ['--lut-n-simulated']),
+    ('sampler_device', 'sampler_device', ['--sampler-device']),
+    ('siren_ckpt_path', 'siren_ckpt_path', ['--siren-ckpt-path']),
+    ('siren_cfg_path', 'siren_cfg_path', ['--siren-cfg-path']),
+    ('sirentv_src', 'sirentv_src', ['--sirentv-src']),
+    ('workers', 'workers', ['--workers']),
+    ('seed', 'seed', ['--seed']),
+]
+
+
+def _option_present(argv, options):
+    for token in argv:
+        if not token.startswith('--'):
+            continue
+        opt = token.split('=', 1)[0]
+        if opt in options:
+            return True
+    return False
+
+
+def _collect_cli_overrides(args, argv):
+    overrides = {}
+    for attr, key, options in CLI_OVERRIDE_SPECS:
+        if _option_present(argv, options):
+            overrides[key] = getattr(args, attr)
+
+    if _option_present(argv, ['--no-digitize']):
+        overrides['no_digitize'] = True
+    elif _option_present(argv, ['--digitize']):
+        overrides['digitize'] = True
+
+    if _option_present(argv, ['--dark-noise', '--no-dark-noise']):
+        overrides['dark_noise'] = args.dark_noise
+        if args.dark_noise:
+            overrides['dark_noise_rate'] = args.dark_noise_rate
+
+    if _option_present(argv, ['--sampler-lazy', '--no-sampler-lazy']):
+        overrides['sampler_lazy'] = args.sampler_lazy
+    if _option_present(argv, ['--sampler-interpolate', '--no-sampler-interpolate']):
+        overrides['sampler_interpolate'] = args.sampler_interpolate
+
+    if _option_present(argv, ['--align', '--no-align']):
+        overrides['align'] = args.align
+
+    return overrides
+
+
+def parse_args(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument('--run-config', '--run-yml', '--run-yaml',
+                               dest='run_config')
+    known, _ = config_parser.parse_known_args(argv)
+
+    run_config = load_run_config(known.run_config)
+    parser_defaults = flatten_config_for_argparse(run_config)
+
+    parser = build_parser(parser_defaults)
+    args = parser.parse_args(argv)
+    args.run_config = known.run_config
+
+    overrides = _collect_cli_overrides(args, argv)
+    args.resolved_config = apply_flat_overrides(run_config, overrides)
+    for key, value in flatten_config_for_argparse(args.resolved_config).items():
+        setattr(args, key, value)
+    return args
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main(argv=None):
+    args = parse_args(argv)
+    run_config = args.resolved_config
+
+    digitization = resolve_digitization(run_config)
+    include_digitize = digitization['enabled']
+    n_bits = digitization['n_bits']
+    pedestal = digitization['pedestal']
+    gain = digitization['gain']
     events_per_file = args.events_per_file
     dataset_name = args.dataset
     label_key = args.label_key
@@ -280,6 +449,8 @@ def main():
     print('=' * 60)
     print(' GOOP Batch Optical Simulation')
     print('=' * 60)
+    if args.run_config:
+        print(f'  Run config:     {args.run_config}')
     print(f'  Data:           {args.data} ({num_events}/{total_events} events)')
     print(f'  Dataset:        {dataset_name}')
     print(f'  Label key:      {label_key}')
@@ -290,12 +461,16 @@ def main():
         print(f'    n_bits:       {n_bits}')
         print(f'    pedestal:     {pedestal:.0f}')
         print(f'    gain:         {gain:.6f}')
-    print(f'  Dark noise:     {"ON" if args.dark_noise else "OFF"}'
-          + (f' ({args.dark_noise_rate} Hz)' if args.dark_noise else ''))
+    sampler_meta = sampler_config(run_config)
+    delay_meta = delay_chain_config(run_config)
+    aux_meta = aux_photon_sources_config(run_config)
+    print(f'  Sampler:        {sampler_meta.get("type", args.sampler).upper()}')
+    print(f'  Sampler config: {json.dumps(sampler_meta, sort_keys=True)}')
+    print(f'  Delays:         {json.dumps(delay_meta, sort_keys=True)}')
+    print(f'  Aux sources:    {json.dumps(aux_meta, sort_keys=True)}')
     print(f'  Baseline noise: {args.baseline_noise_std}')
     print(f'  Tick:           {args.tick_ns} ns')
     print(f'  Oversample:     {args.oversample}x')
-    print(f'  Sampler:        {args.sampler.upper()}')
     print(f'  Voxel dx:       {args.voxel_dx} mm'
           + ('  (disabled)' if args.voxel_dx <= 0 else ''))
     print(f'  Total pad:      {args.total_pad:,}')
@@ -322,32 +497,7 @@ def main():
 
     # ---- Create GOOP simulator ----
     t_goop = time.time()
-    if args.sampler == 'lut':
-        tof_sampler = create_default_tof_sampler()
-    else:  # siren
-        tof_sampler = create_siren_tof_sampler(device='cuda')
-    goop_config = OpticalSimConfig(
-        tof_sampler=tof_sampler,
-        delays=[
-            ScintillationBiexponentialDelay(
-                singlet_fraction=0.3, tau_singlet_ns=6.0, tau_triplet_ns=1300.0),
-            TPBTriexponentialDelay(),
-            TTSDelay(fwhm_ns=2.4, apply_transit_time=True),
-        ],
-        tick_ns=args.tick_ns,
-        kernel=SERKernel(device=torch.device("cuda"), duration_ns=10000),
-        gain=gain,
-        n_labels_to_simulate=N_labels,
-        time_window_ns=time_window_ns,
-        oversample=args.oversample,
-        ser_jitter_std=args.ser_jitter_std,
-        baseline_noise_std=args.baseline_noise_std,
-        aux_photon_sources=(
-            [DarkNoise(rate_hz=args.dark_noise_rate)] if args.dark_noise else []),
-        digitization=(
-            DigitizationConfig(n_bits=n_bits, pedestal=pedestal)
-            if include_digitize else None),
-    )
+    goop_config = build_optical_config(run_config, gain=gain, n_labels=N_labels)
     goop_sim = OpticalSimulator(goop_config)
     t_goop = time.time() - t_goop
     print(f'  GOOP creation:    {t_goop:.1f}s')
@@ -457,6 +607,11 @@ def main():
                 dataset_name=dataset_name,
                 file_index=file_idx,
                 source_file=args.data,
+                pca_lut_path=pca_lut_path(run_config),
+                sampler_type=sampler_meta.get('type', ''),
+                sampler_config=sampler_meta,
+                delay_chain=delay_meta,
+                aux_photon_sources=aux_meta,
                 n_events=n_in_file,
                 global_event_offset=event_start,
             )
@@ -515,18 +670,6 @@ def main():
                     pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = extract_goop_inputs(
                         filled, cfg, label_key)
 
-                    # Snapshot the raw (pre-voxelization) per-segment arrays
-                    # as numpy. These are the ground-truth TPC inputs that will
-                    # be saved alongside the simulated waveforms — even when
-                    # voxelization is enabled, the file holds original segment
-                    # granularity (with pdg / dE preserved).
-                    raw_pos = np.asarray(pos_mm)
-                    raw_nph = np.asarray(n_ph)
-                    raw_tns = np.asarray(t_ns)
-                    raw_lbl = np.asarray(labels)
-                    raw_pdg = np.asarray(pdgs)
-                    raw_des = np.asarray(des)
-
                     n_after = total_segs
                     if args.time_window_ns > 0:
                         rand_time_tpcs_ns = throw_in_time_window(pos_mm, n_ph, t_ns, labels, time_window_ns=args.time_window_ns, pdgs=pdgs, de=des)
@@ -537,23 +680,31 @@ def main():
                         pdgs = rand_time_tpcs_ns["pdgs"]
                         des = rand_time_tpcs_ns["de"]
                         n_after = pos_mm.shape[0]
+
+                    # Snapshot the post-window, pre-voxelization per-segment
+                    # arrays as numpy. These are the TPC inputs saved alongside
+                    # the simulated waveforms; voxelization is only a simulator
+                    # acceleration path.
+                    raw_pos = _as_numpy(pos_mm)
+                    raw_nph = _as_numpy(n_ph)
+                    raw_tns = _as_numpy(t_ns)
+                    raw_lbl = _as_numpy(labels)
+                    raw_pdg = _as_numpy(pdgs)
+                    raw_des = _as_numpy(des)
+
+                    sim_pos, sim_nph, sim_tns, sim_labels = pos_mm, n_ph, t_ns, labels
                     t_vox = 0.0
                     if args.voxel_dx > 0:
                         tv0 = time.time()
-                        pos_mm_vox, n_ph_vox, t_ns_vox, labels_vox = voxelize_labeled(
+                        sim_pos, sim_nph, sim_tns, sim_labels = voxelize_labeled(
                             pos_mm, n_ph, t_ns, labels, args.voxel_dx,
                         )
-                        # pdg/de are per-segment; drop them on the simulator
-                        # path after voxelization since voxels merge segments
-                        # with potentially different pdgs. The raw_* snapshots
-                        # above keep the unmerged truth for saving.
-                        pdgs_vox, des_vox = None, None
                         t_vox = time.time() - tv0
-                        n_after = pos_mm_vox.shape[0]
+                        n_after = sim_pos.shape[0]
                     # Re-anchor t0 so t_goop_elapsed measures only goop_sim.simulate.
                     t0 = time.time()
                     waveforms = goop_sim.simulate(
-                        pos_mm, n_ph, t_ns, labels=labels,
+                        sim_pos, sim_nph, sim_tns, labels=sim_labels,
                         stitched=True, subtract_t0=False if args.time_window_ns > 0 else True)
 
                     # 4.1 - Align Waveforms
@@ -568,13 +719,13 @@ def main():
                         wvfm.attrs['pe_counts'].sum().item()
                         for wvfm in waveforms)
                     total_chunks = sum(wvfm.n_chunks for wvfm in waveforms)
-                    total_photons = int(n_ph.sum())
+                    total_photons = int(sim_nph.sum())
 
                     # 4. GPU → CPU transfer + save (serial or queued)
                     t0 = time.time()
                     waveforms_cpu = waveforms_to_cpu(waveforms)
                     item = (event_key, waveforms_cpu, evt_idx,
-                            pos_mm, n_ph, t_ns, labels, des, pdgs)
+                            raw_pos, raw_nph, raw_tns, raw_lbl, raw_des, raw_pdg)
 
                     if num_workers > 0:
                         save_queue.put(item)
@@ -597,6 +748,7 @@ def main():
 
                     del deposits, filled, waveforms, waveforms_cpu
                     del pos_mm, n_ph, t_ns, labels, pdgs, des
+                    del sim_pos, sim_nph, sim_tns, sim_labels
                     del raw_pos, raw_nph, raw_tns, raw_lbl, raw_pdg, raw_des
                     gc.collect()
 

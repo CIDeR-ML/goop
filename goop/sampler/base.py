@@ -685,6 +685,13 @@ class PCATOFSampler(TOFSamplerBase):
         ``sample_pdf`` would emit for this chunk, but without materialising the
         flat ``(M·Q,)`` photon lists (they stay inside this function's scope).
 
+        Each photon's weight is split between two adjacent bins by linear
+        interpolation on the fractional bin offset ("soft binning"). The integer
+        bin index is detached, but the interpolation weights are autograd-live,
+        so gradients flow through ``q_abs`` -> ``t_step`` (and any other input
+        affecting photon arrival time). Total weight is preserved bin-for-bin
+        with hard binning in expectation.
+
         Designed to be wrapped in ``torch.utils.checkpoint.checkpoint(...,
         use_reentrant=False)`` so the transient ``(M, Q)`` tensors are not
         saved for backward — they're recomputed on demand.
@@ -716,15 +723,31 @@ class PCATOFSampler(TOFSamplerBase):
 
         weights = active_expected.unsqueeze(-1) * du_eff.unsqueeze(0)  # (M, Q)
 
-        bin_idx = ((q_abs - t0_ref) / tick_ns).long()                # (M, Q)
-        in_window = (bin_idx >= 0) & (bin_idx < n_bins)
-        bin_idx = bin_idx.clamp(0, n_bins - 1)
-        weights = weights * in_window                                 # zero out-of-window
+        # Soft binning: split each photon's weight between adjacent bins by
+        # linear interpolation on the fractional bin offset. Floor cast (`bin_lo`)
+        # is detached so no gradient flows through the integer index, but `frac`
+        # is autograd-live -> unit gradient path q_abs -> {w_lo, w_hi}.
+        frac     = (q_abs - t0_ref) / tick_ns                       # (M, Q) autograd-live
+        bin_lo   = frac.detach().floor().long()                     # (M, Q) detached
+        w_hi     = frac - bin_lo                                     # (M, Q) in [0, 1)
+        w_lo     = 1.0 - w_hi
+        bin_hi   = bin_lo + 1
+        in_lo    = (bin_lo >= 0) & (bin_lo < n_bins)
+        in_hi    = (bin_hi >= 0) & (bin_hi < n_bins)
+        bin_lo_c = bin_lo.clamp(0, n_bins - 1)
+        bin_hi_c = bin_hi.clamp(0, n_bins - 1)
 
-        # Fused scatter: flatten to (2P·n_bins,) with composite (channel, bin) index.
-        flat_idx = active_pmt.unsqueeze(-1) * n_bins + bin_idx        # (M, Q)
+        w_lo_eff = weights * w_lo * in_lo                           # (M, Q)
+        w_hi_eff = weights * w_hi * in_hi                           # (M, Q)
+
+        # Two scatters into a flat (2P · n_bins,) buffer, one per adjacent bin.
+        base_idx    = active_pmt.unsqueeze(-1) * n_bins             # (M, 1)
+        flat_idx_lo = base_idx + bin_lo_c                           # (M, Q)
+        flat_idx_hi = base_idx + bin_hi_c                           # (M, Q)
         flat_hist = chunk_hist.view(-1).scatter_add(
-            0, flat_idx.reshape(-1), weights.reshape(-1)
+            0, flat_idx_lo.reshape(-1), w_lo_eff.reshape(-1),
+        ).scatter_add(
+            0, flat_idx_hi.reshape(-1), w_hi_eff.reshape(-1),
         )
         return flat_hist.view(n_ch, n_bins)
 

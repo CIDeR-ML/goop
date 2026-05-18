@@ -27,6 +27,7 @@ def create_default_tof_sampler(**kwargs) -> TOFSamplerBase:
     Note: ``differentiable`` is accepted for backward compatibility but is a no-op —
     every ``PCATOFSampler`` exposes both ``sample`` and ``sample_pdf``.
     """
+    plib_path = kwargs.pop("plib_path", kwargs.pop("filepath", DEFAULT_PLIB_PATH))
     default_kwargs = {
         "n_simulated": DEFAULT_N_SIMULATED,
         "lazy": False,
@@ -36,7 +37,7 @@ def create_default_tof_sampler(**kwargs) -> TOFSamplerBase:
     }
     default_kwargs.update(kwargs)
     default_kwargs.pop("differentiable", None)  # back-compat no-op
-    return TOFSampler(DEFAULT_PLIB_PATH, **default_kwargs)
+    return TOFSampler(plib_path, **default_kwargs)
 
 
 class TOFSampler(PCATOFSampler):
