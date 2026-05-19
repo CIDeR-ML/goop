@@ -2,7 +2,7 @@
 Batch optical simulation: run jaxtpc light generation + GOOP waveform production.
 
 Produces one file type per batch:
-    {dataset}_sensor_{NNNN}.h5  — per-PMT SlicedWaveform data (digitized or raw)
+    {dataset}_sensor_optical_{NNNN}.h5  — per-PMT SlicedWaveform data (digitized or raw)
 
 See README.md for pipeline details, output schema, and performance benchmarks.
 
@@ -443,8 +443,8 @@ def main(argv=None):
     N_labels = get_num_labels(label_dist)
 
     # Output directory
-    sensor_dir = os.path.join(args.outdir, 'sensor')
-    os.makedirs(sensor_dir, exist_ok=True)
+    optical_dir = os.path.join(args.outdir, 'sensor_optical')
+    os.makedirs(optical_dir, exist_ok=True)
 
     print('=' * 60)
     print(' GOOP Batch Optical Simulation')
@@ -477,7 +477,7 @@ def main(argv=None):
     print(f'  Workers:        {args.workers} {"(serial)" if args.workers == 0 else "(threaded)"}')
     print(f'  JAX device:     {jax.devices()[0]}')
     print(f'  CUDA device:    {torch.cuda.get_device_name(0)}')
-    print(f'  Output:         {sensor_dir}/')
+    print(f'  Output:         {optical_dir}/')
     print(f'  Label dist:     {label_dist}')
     print(f'  Time window:    {time_window_ns} ns')
     print()
@@ -593,13 +593,13 @@ def main(argv=None):
         event_end = min(event_start + events_per_file, num_events)
         n_in_file = event_end - event_start
 
-        sensor_path = os.path.join(
-            sensor_dir, f'{dataset_name}_sensor_{file_idx:04d}.h5')
+        optical_path = os.path.join(
+            optical_dir, f'{dataset_name}_sensor_optical_{file_idx:04d}.h5')
 
         print(f'File {file_idx:04d}: events {event_start}\u2013{event_end-1} '
               f'({n_in_file} events)')
 
-        with h5py.File(sensor_path, 'w') as f:
+        with h5py.File(optical_path, 'w') as f:
             write_config_light(
                 f, goop_config,
                 label_key=label_key,
@@ -761,16 +761,16 @@ def main(argv=None):
                     t.join()
 
         # File size
-        sensor_mb = os.path.getsize(sensor_path) / (1024 * 1024)
-        print(f'  \u2192 sensor: {sensor_mb:.1f} MB '
-              f'({sensor_mb / n_in_file * 1024:.1f} KB/event)')
+        optical_mb = os.path.getsize(optical_path) / (1024 * 1024)
+        print(f'  \u2192 optical: {optical_mb:.1f} MB '
+              f'({optical_mb / n_in_file * 1024:.1f} KB/event)')
         print()
 
     total_elapsed = time.time() - total_start
     print(f'{"=" * 60}')
     print(f'  Done. {num_events} events in {total_elapsed:.1f}s')
     print(f'  Average: {total_elapsed/num_events:.2f}s/event')
-    print(f'  Files:   {num_files} in {sensor_dir}/')
+    print(f'  Files:   {num_files} in {optical_dir}/')
     print(f'{"=" * 60}')
 
 

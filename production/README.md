@@ -44,7 +44,7 @@ python3 production/run_batch.py \
 | `--data` | `out.h5` | Input HDF5 file (edep-sim output) |
 | `--config` | `jaxtpc/config/cubic_wireplane_config.yaml` | Detector geometry YAML |
 | `--dataset` | `sim` | Dataset name prefix for output files |
-| `--outdir` | `.` | Output directory (creates `sensor/` subdir) |
+| `--outdir` | `.` | Output directory (creates `sensor_optical/` subdir) |
 | `--events` | all | Number of events to process |
 | `--events-per-file` | 1000 | Events per output HDF5 file |
 | `--label-key` | `interaction` | Per-waveform label: `interaction`, `track`, `ancestor`, or `volume` |
@@ -173,7 +173,7 @@ Reduction is ~15–20× at 20 mm. The simulator output is unchanged in expectati
 One file type per batch, split by `events_per_file`:
 
 ```
-{dataset}_sensor_{NNNN}.h5   — per-PMT optical waveforms (SlicedWaveform)
+{dataset}_sensor_optical_{NNNN}.h5   — per-PMT optical waveforms (SlicedWaveform)
 ```
 
 ### Sensor File Schema
