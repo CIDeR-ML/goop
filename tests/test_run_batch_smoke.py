@@ -160,9 +160,9 @@ def test_main_subprocess_one_event(out_h5_path, tmp_path):
         f"--- stderr (tail) ---\n{res.stderr[-2000:]}"
     )
     # Output file should exist and be non-empty.
-    sensors = list((out / "sensor").glob("*.h5"))
-    assert len(sensors) == 1, f"expected one sensor file, got {sensors}"
-    assert sensors[0].stat().st_size > 0
+    opticals = list((out / "sensor_optical").glob("*.h5"))
+    assert len(opticals) == 1, f"expected one optical file, got {opticals}"
+    assert opticals[0].stat().st_size > 0
     # Print sanity: the per-event timing row must include the t_vox column.
     assert "t_vox" in res.stdout
     assert "Average:" in res.stdout
