@@ -28,7 +28,7 @@ The repository is run directly from source. The only required submodule is
 `jaxtpc`.
 
 ```bash
-git clone --recursive <repo-url> goop
+git clone --recursive https://github.com/CIDeR-ML/goop.git goop
 cd goop
 
 # If the clone was made without --recursive:
@@ -423,6 +423,14 @@ pytest tests/ -q
 python tests/data/regen_edepsim_event0.py
 ```
 
+The suite covers (~195 unit + integration tests):
+
+- `tests/test_simulator.py` — kernel/delay/digitize unit tests, dense ↔ sliced waveform roundtrips, `align_to`/`align_with`, oversample closure, SER jitter and baseline noise; **`TestLabeledMode`** pins the per-label `simulate(labels=...)` path (including `pdgs`/`de` optional handling and `return_tpc` 7-tuple shape); **`TestProductionPipeline`** covers the extract → voxelize → simulate handoff.
+- `tests/test_voxelize.py` — `goop.utils.voxelize` exact photon-yield preservation, monotonic voxel-count vs `dx`, numpy↔torch dispatch, GPU vs CPU bit-equality, edge cases.
+- `tests/test_differentiable_*.py` — differentiable kernels and TOF sampler (`sample_pdf`, `histogram_pdf`, photon-conservation invariants).
+- `tests/test_real_edepsim.py` — stoch/diff sliced/dense matrix on a real event, plus stoch ≈ diff yield equivalence.
+- `tests/test_run_batch_smoke.py` — imports `production/run_batch.py` (catches missing-import / merge-artifact bugs that pytest can't otherwise see), and runs `run_batch.main()` as a subprocess on the real `out.h5` fixture (skipped automatically when the fixture or a free-enough GPU isn't available; set `GOOP_TEST_OUT_H5` to override the path).
+
 ### Performance benchmarks
 
 Speed regressions on the realistic-event matrix are tracked with `pytest-benchmark`. Six benchmarks (`stoch/diff × sliced/dense fwd` + `diff fwd+bwd` × `sliced/dense`) live in `tests/test_real_edepsim_bench.py`. They are skipped by default (`pytest.ini: addopts = --benchmark-skip`).
@@ -453,4 +461,3 @@ Reference numbers from a single A100-class GPU on event 0 (12 k voxelized segmen
 | `stoch dense fwd` | 654 ms |
 
 ## TODO
-
