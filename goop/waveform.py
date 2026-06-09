@@ -551,12 +551,18 @@ class SlicedWaveform:
             attrs=dict(self.attrs),
         )
     
-    def align(self, fill: float = 0.0) -> SlicedWaveform:
+    def align(self, fill: Optional[float] = None) -> SlicedWaveform:
         """Rewrite each active channel as a single chunk spanning the global
         ``[min_t0, max_t_end]`` window, padding gaps with ``fill``.
 
+        When ``fill`` is omitted, use ``attrs["pedestal"]`` if present,
+        otherwise use ``0.0``.
+
         Vectorized. (180 ms --> 13 ms)
         """
+        if fill is None:
+            fill = float(self.attrs.get("pedestal", 0.0))
+
         device = self.adc.device
 
         if self.n_chunks == 0:

@@ -66,8 +66,11 @@ def test_flat_legacy_config_maps_to_nested():
         "detector_config": "jaxtpc/config/cubic_wireplane_config.yaml",
         "dataset": "legacy",
         "outdir": "/tmp/out",
+        "start_event": 5,
         "events": None,
         "events_per_file": 7,
+        "file_index_offset": 11,
+        "skip_existing": True,
         "digitize": False,
         "dark_noise": True,
         "dark_noise_rate": 1234.0,
@@ -80,7 +83,10 @@ def test_flat_legacy_config_maps_to_nested():
     assert flat["data"] == "/tmp/input.h5"
     assert flat["config"] == "jaxtpc/config/cubic_wireplane_config.yaml"
     assert flat["dataset"] == "legacy"
+    assert flat["start_event"] == 5
     assert flat["events_per_file"] == 7
+    assert flat["file_index_offset"] == 11
+    assert flat["skip_existing"] is True
     assert flat["no_digitize"] is True
     assert flat["dark_noise"] is True
     assert flat["dark_noise_rate"] == 1234.0
@@ -124,11 +130,20 @@ def test_production_presets_load():
     for rel in [
         "production/configs/out_full_prod.yml",
         "production/configs/out_full_prod_pixel.yml",
+        "production/configs/test_00_00_02_pixel_full.yml",
     ]:
         cfg = normalize_run_config(
             yaml.safe_load((REPO_ROOT / rel).read_text()),
             rel,
         )
-        assert sampler_config(cfg)["type"] == "lut"
+        assert sampler_config(cfg)["type"] in {"lut", "siren"}
+        if rel.endswith("_pixel.yml"):
+            assert cfg["detector"]["config"] == "jaxtpc/config/cubic_pixel_config.yaml"
+        if rel.endswith("pixel_full.yml"):
+            assert cfg["detector"]["config"] == "jaxtpc/config/cubic_pixel_config.yaml"
+            assert cfg["run"]["events"] == 200
+            assert cfg["run"]["events_per_file"] == 200
+            assert cfg["output"]["dataset"] == "test_00_00_02_pixel"
+            assert cfg["output"]["outdir"] == "/sdf/data/neutrino/doraemon/optical_test_00_00_02/"
         assert delay_chain_config(cfg)
         assert aux_photon_sources_config(cfg) == []

@@ -81,8 +81,11 @@ def test_run_config_yaml_defaults(tmp_path):
             "detector_config: jaxtpc/config/cubic_wireplane_config.yaml",
             "dataset: yaml_dataset",
             "outdir: /tmp/out",
+            "start_event: 20",
             "events: null",
             "events_per_file: 7",
+            "file_index_offset: 3",
+            "skip_existing: true",
             "digitize: false",
             "dark_noise: true",
             "align: true",
@@ -94,7 +97,10 @@ def test_run_config_yaml_defaults(tmp_path):
 
     args = module.parse_args([
         "--run-config", str(run_config),
+        "--start-event", "8",
         "--events", "3",
+        "--file-index-offset", "9",
+        "--no-skip-existing",
         "--digitize",
         "--no-dark-noise",
         "--no-align",
@@ -104,8 +110,11 @@ def test_run_config_yaml_defaults(tmp_path):
     assert args.data == "/tmp/input.h5"
     assert args.config == "jaxtpc/config/cubic_wireplane_config.yaml"
     assert args.dataset == "yaml_dataset"
+    assert args.start_event == 8
     assert args.events == 3
     assert args.events_per_file == 7
+    assert args.file_index_offset == 9
+    assert args.skip_existing is False
     assert args.no_digitize is False
     assert args.dark_noise is False
     assert args.align is False

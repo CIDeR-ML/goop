@@ -434,6 +434,23 @@ class TestSlicedWaveformAlign:
         ])
         assert torch.allclose(aligned.adc, expected)
 
+    def test_align_defaults_to_pedestal_fill(self):
+        sw = _make_align_sw(
+            adc_chunks=[
+                torch.tensor([1.0, 2.0]),
+                torch.tensor([4.0]),
+            ],
+            t0_chunks=[10.0, 14.0],
+            pmt_chunks=[0, 0],
+            tick_ns=1.0, n_channels=2,
+        )
+        sw.attrs["pedestal"] = 1234.0
+
+        aligned = sw.align()
+
+        expected = torch.tensor([1.0, 2.0, 1234.0, 1234.0, 4.0])
+        assert torch.allclose(aligned.adc, expected)
+
     def test_align_idempotent_for_aligned_input(self):
         # Already aligned: one chunk per active PMT, common t0, no gaps.
         sw = _make_align_sw(

@@ -38,41 +38,47 @@ python3 production/run_batch.py \
 
 ### CLI Flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `--run-config`, `--run-yml`, `--run-yaml` | unset | YAML file containing run defaults. CLI flags override values loaded from the file. |
-| `--data` | `out.h5` | Input HDF5 file (edep-sim output) |
-| `--config` | `jaxtpc/config/cubic_wireplane_config.yaml` | Detector geometry YAML |
-| `--dataset` | `sim` | Dataset name prefix for output files |
-| `--outdir` | `.` | Output directory (creates `sensor_optical/` subdir) |
-| `--events` | all | Number of events to process |
-| `--events-per-file` | 1000 | Events per output HDF5 file |
-| `--label-key` | `interaction` | Per-waveform label: `interaction`, `track`, `ancestor`, or `volume` |
-| `--n-bits` | 15 | ADC bit depth |
-| `--pedestal` | `0.9 * (2^n_bits - 1)` | ADC pedestal value |
-| `--max-pe-per-pmt` | 90000 | PE scale for gain calculation |
-| `--no-digitize` | (digitize ON) | Disable ADC digitization |
-| `--dark-noise` | off | Enable dark noise |
-| `--dark-noise-rate` | 2000.0 | Dark noise rate in Hz |
-| `--baseline-noise-std` | 0.0 | Gaussian baseline noise std |
-| `--ser-jitter-std` | 0.1 | SER weight jitter std |
-| `--tick-ns` | 1.0 | Output time bin width in ns |
-| `--oversample` | 10 | Internal oversampling factor |
-| `--total-pad` | 250,000 | Max deposits per side (jaxtpc JIT shape) |
-| `--response-chunk-size` | 50,000 | jaxtpc response chunk size |
-| `--sampler` | `lut` | TOF sampler backend: `lut` (eager voxel LUT) or `siren` (SIREN neural net) |
-| `--pca-lut-path`, `--plib-path` | `/sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5` | PCA photon-library HDF5 used by the LUT sampler, and as the PCA basis for SIREN |
-| `--pmt-qe` | 0.12 | PMT quantum efficiency passed to the TOF sampler |
-| `--lut-n-simulated` | 15,000,000 | Number of simulated photons represented by the PCA LUT |
-| `--sampler-device` | `cuda:0` | Device string passed to the TOF sampler |
-| `--sampler-lazy` / `--no-sampler-lazy` | eager | Toggle lazy HDF5-backed LUT access |
-| `--sampler-interpolate` / `--no-sampler-interpolate` | interpolate | Toggle LUT interpolation |
-| `--voxel-dx` | 0.0 | Voxelize input segments to a cubic grid of side length `dx` (mm) before goop simulate, performed per-label group. `0` disables. |
-| `--workers` | 2 | Number of save worker threads (0 = serial) |
-| `--seed` | 42 | Random seed |
-| `--align` | off | Align chunks when returning `List[SlicedWaveform]` |
-| `--time-window-ns` | 10000 | Time window to mimic the beam window |
-| `--label-dist` | Uniform | [Uniform, Poisson, HalfNormal] Type of distribution to sample N interactions |
+
+| Flag                                                 | Default                                                               | Description                                                                                                                         |
+| ---------------------------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `--run-config`, `--run-yml`, `--run-yaml`            | unset                                                                 | YAML file containing run defaults. CLI flags override values loaded from the file.                                                  |
+| `--data`                                             | `out.h5`                                                              | Input HDF5 file (edep-sim output)                                                                                                   |
+| `--config`                                           | `jaxtpc/config/cubic_wireplane_config.yaml`                           | Detector geometry YAML                                                                                                              |
+| `--dataset`                                          | `sim`                                                                 | Dataset name prefix for output files                                                                                                |
+| `--outdir`                                           | `.`                                                                   | Output directory (creates `sensor_optical/` subdir)                                                                                         |
+| `--start-event`                                      | 0                                                                     | Absolute source event index to start processing                                                                                     |
+| `--events`                                           | all                                                                   | Number of events to process                                                                                                         |
+| `--events-per-file`                                  | 1000                                                                  | Events per output HDF5 file                                                                                                         |
+| `--label-key`                                        | `interaction`                                                         | Per-waveform label: `interaction`, `track`, `ancestor`, or `volume`                                                                 |
+| `--n-bits`                                           | 15                                                                    | ADC bit depth                                                                                                                       |
+| `--pedestal`                                         | `0.9 * (2^n_bits - 1)`                                                | ADC pedestal value                                                                                                                  |
+| `--max-pe-per-pmt`                                   | 90000                                                                 | PE scale for gain calculation                                                                                                       |
+| `--no-digitize`                                      | (digitize ON)                                                         | Disable ADC digitization                                                                                                            |
+| `--dark-noise`                                       | off                                                                   | Enable dark noise                                                                                                                   |
+| `--dark-noise-rate`                                  | 2000.0                                                                | Dark noise rate in Hz                                                                                                               |
+| `--baseline-noise-std`                               | 0.0                                                                   | Gaussian baseline noise std                                                                                                         |
+| `--ser-jitter-std`                                   | 0.1                                                                   | SER weight jitter std                                                                                                               |
+| `--tick-ns`                                          | 1.0                                                                   | Output time bin width in ns                                                                                                         |
+| `--oversample`                                       | 10                                                                    | Internal oversampling factor                                                                                                        |
+| `--total-pad`                                        | 250,000                                                               | Max deposits per side (jaxtpc JIT shape)                                                                                            |
+| `--response-chunk-size`                              | 50,000                                                                | jaxtpc response chunk size                                                                                                          |
+| `--sampler`                                          | `lut`                                                                 | TOF sampler backend: `lut` (eager voxel LUT) or `siren` (SIREN neural net)                                                          |
+| `--pca-lut-path`, `--plib-path`                      | `/sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5` | PCA photon-library HDF5 used by the LUT sampler, and as the PCA basis for SIREN                                                     |
+| `--pmt-qe`                                           | 0.12                                                                  | PMT quantum efficiency passed to the TOF sampler                                                                                    |
+| `--lut-n-simulated`                                  | 15,000,000                                                            | Number of simulated photons represented by the PCA LUT                                                                              |
+| `--sampler-device`                                   | `cuda:0`                                                              | Device string passed to the TOF sampler                                                                                             |
+| `--sampler-lazy` / `--no-sampler-lazy`               | eager                                                                 | Toggle lazy HDF5-backed LUT access                                                                                                  |
+| `--sampler-interpolate` / `--no-sampler-interpolate` | interpolate                                                           | Toggle LUT interpolation                                                                                                            |
+| `--voxel-dx`                                         | 0.0                                                                   | Voxelize input segments to a cubic grid of side length `dx` (mm) before goop simulate, performed per-label group. `0` disables.     |
+| `--file-index-offset`                                | 0                                                                     | Output file index for the first produced file                                                                                       |
+| `--overwrite` / `--no-overwrite`                     | no-overwrite                                                          | Replace existing output files only after a complete temporary-file write                                                            |
+| `--skip-existing`, `--resume`                        | off                                                                   | Skip complete existing output files with matching source and event offset                                                           |
+| `--workers`                                          | 2                                                                     | Number of save worker threads (0 = serial)                                                                                          |
+| `--seed`                                             | 42                                                                    | Random seed                                                                                                                         |
+| `--align`                                            | off                                                                   | Align chunks when returning `List[SlicedWaveform]`                                                                                  |
+| `--time-window-ns`                                   | disabled                                                              | Randomly place labels inside a time window and crop outside it. `0` or YAML `null` disables this.                                   |
+| `--label-dist`                                       | All                                                                   | `All` simulates every label in each event. `Uniform`, `Poisson`, `HalfNormal`, or `Fixed` simulate a random/fixed subset of labels. |
+
 
 ### YAML Run Configs
 
@@ -80,6 +86,10 @@ Run configs are nested by subsystem. Components use an explicit `type` field,
 and every sibling key is passed to that component constructor as a kwarg. Omit
 `aux_photon_sources`, or set it to `[]`, for no dark noise or other auxiliary
 photon sources.
+
+For full-event production from an existing input file, use `label_dist: All`
+and `time_window_ns: null` so the runner does not randomly subset interaction
+labels or randomly reposition/crop deposits in time.
 
 ```yaml
 sampler:
@@ -112,8 +122,8 @@ Flat legacy keys are still accepted. For example, `pca_lut_path` / `plib_path`
 map to `sampler.plib_path`, and `dark_noise: true` with `dark_noise_rate` maps
 to a `DarkNoise` aux source.
 
-`production/configs/out_full_prod.yml` is set up for a full production run over
-all events in `/sdf/home/y/youngsam/sw/dune/sirentv/data/out.h5`:
+`production/configs/out_full_prod.yml` is set up as a production-style preset.
+Run it directly for a single contiguous shard:
 
 ```bash
 python3 production/run_batch.py --run-config production/configs/out_full_prod.yml
@@ -128,6 +138,54 @@ python3 production/run_batch.py \
     --dataset debug_10
 ```
 
+### Slurm Arrays
+
+Use `production/slurm_array.sbatch` for non-overlapping Slurm shards. Each
+array task computes:
+
+```text
+start_event = BASE_EVENT + SLURM_ARRAY_TASK_ID * EVENTS_PER_TASK
+file_index_offset = FILE_INDEX_BASE + SLURM_ARRAY_TASK_ID * ceil(EVENTS_PER_TASK / EVENTS_PER_FILE)
+```
+
+Example 1M-event launch with 1000 events per task:
+
+```bash
+sbatch \
+    --array=0-999 \
+    --export=ALL,GOOP_ENV_SETUP=/path/to/setup-goop-env.sh,EVENTS_PER_TASK=1000,EVENTS_PER_FILE=1000,RUN_CONFIG=production/configs/out_full_prod.yml \
+    production/slurm_array.sbatch
+```
+
+The template exports `PYTHONPATH` for this source tree, disables JAX prealloc by
+default, and runs `production/run_batch.py` with `--skip-existing`. Existing
+files are skipped only when `/config.attrs` report the expected source file,
+event count, and global event offset. Incomplete or mismatched files fail fast;
+rerun those shards with `--overwrite` after inspecting or removing the bad file.
+
+### Full test_00_00_02 Run
+
+Use `production/slurm_test_00_00_02_4a100.sbatch` to sweep the full
+`/sdf/data/neutrino/doraemon/test_00_00_02/run_0027575715/` dataset with four
+A100s. The launcher:
+
+1. sorts the 100 `edepsim_*.h5` files
+2. splits them across `--array=0-3`
+3. runs one input file per `production/run_batch.py` invocation
+4. keeps the output file index aligned with the source file index
+
+Submission example:
+
+```bash
+sbatch \
+    --export=ALL,GOOP_ENV_SETUP=/path/to/setup-goop-env.sh \
+    production/slurm_test_00_00_02_4a100.sbatch
+```
+
+This preset uses `production/configs/test_00_00_02_pixel_full.yml`, so the
+geometry, pixel LUT, dataset name, and output directory are fixed for the full
+dataset pass.
+
 ## Pipeline
 
 For each event, `run_batch.py` performs:
@@ -137,24 +195,26 @@ For each event, `run_batch.py` performs:
 3. **Extract** GOOP inputs: `positions_mm`, `ceil(photons).int32`, `t0_us * 1000` (-> ns), per-deposit labels (interaction ID by default; configurable via `--label-key`)
 4. **Voxelize** *(optional, when `--voxel-dx > 0`)* — bin segments per-label-group into a cubic grid of side length `dx` mm via `voxelize_labeled`. Photon counts are summed within each voxel; positions and times are photon-weighted means. 4. **Voxelize** *(optional, when `--voxel-dx > 0`)* — bin segments per-label-group into a cubic grid of side length `dx` mm via `voxelize_labeled`. Photon counts are summed within each voxel; positions and times are photon-weighted means. Empirically a `dx` of 10 mm results in 20x less point simulated but indistinguishable waveforms.
 5. **Optical simulation** via GOOP `OpticalSimulator.simulate` — produces one `SlicedWaveform` per unique label value:
-   - TOF sampling: either eager voxel LUT (default, `--sampler lut`) or SIREN neural net (`--sampler siren`); both use the same PCA basis (50 components, quantile-log) and inverse-CDF photon-time draw
-   - Stochastic delays: scintillation (bi-exponential), TPB re-emission (tri-exponential), PMT TTS (Gaussian)
-   - Optional dark noise injection
-   - Histogramming into per-PMT time bins
-   - FFT convolution with SER kernel (10 us duration)
-   - Optional baseline noise + ADC digitization (15-bit, pedestal offset, saturation clamping)
+  - TOF sampling: either eager voxel LUT (default, `--sampler lut`) or SIREN neural net (`--sampler siren`); both use the same PCA basis (50 components, quantile-log) and inverse-CDF photon-time draw
+  - Stochastic delays: scintillation (bi-exponential), TPB re-emission (tri-exponential), PMT TTS (Gaussian)
+  - Optional dark noise injection
+  - Histogramming into per-PMT time bins
+  - FFT convolution with SER kernel (10 us duration)
+  - Optional baseline noise + ADC digitization (15-bit, pedestal offset, saturation clamping)
 6. **Save** per-label `SlicedWaveform` to HDF5 via `save_event_light`
 
 ### Label Keys
 
 The `--label-key` flag controls how deposits are grouped into separate waveforms:
 
-| Key | Field | Description |
-|---|---|---|
-| `interaction` | `interaction_ids` | One waveform per interaction vertex (default) |
-| `track` | `track_ids` | One waveform per GEANT4 particle track |
-| `ancestor` | `ancestor_track_ids` | One waveform per primary shower ancestor |
-| `volume` | synthetic | One waveform per detector volume (east/west) |
+
+| Key           | Field                | Description                                   |
+| ------------- | -------------------- | --------------------------------------------- |
+| `interaction` | `interaction_ids`    | One waveform per interaction vertex (default) |
+| `track`       | `track_ids`          | One waveform per GEANT4 particle track        |
+| `ancestor`    | `ancestor_track_ids` | One waveform per primary shower ancestor      |
+| `volume`      | synthetic            | One waveform per detector volume (east/west)  |
+
 
 ### TOF Sampler Choice
 
@@ -197,6 +257,7 @@ One file type per batch, split by `events_per_file`:
 ```
 
 **Decode:**
+
 ```python
 # Chunk k spans adc[offsets[k]:offsets[k+1]]
 # with time origin t0_ns[k] on PMT channel pmt_id[k]
@@ -222,24 +283,28 @@ for wf in waveforms:
 
 ## Model Sizes
 
-| Component | Size | Notes |
-|---|---|---|
-| Photon library (LUT sampler) | ~26 GB | PCA-compressed, quantile-log, 50 components. Loaded eagerly into GPU VRAM. |
-| SIREN sampler | ~500 MB | Pre-trained `PcaSiren` checkpoint; predicts the same `(vis, t0, coeffs)` as the LUT on demand. |
-| SER kernel | ~10K samples | 10 us duration at 1 ns tick, oversampled 10x internally |
-| 162 PMT channels | 81 per volume | x-reflection symmetry maps half-detector library to full coverage |
+
+| Component                    | Size          | Notes                                                                                          |
+| ---------------------------- | ------------- | ---------------------------------------------------------------------------------------------- |
+| Photon library (LUT sampler) | ~26 GB        | PCA-compressed, quantile-log, 50 components. Loaded eagerly into GPU VRAM.                     |
+| SIREN sampler                | ~500 MB       | Pre-trained `PcaSiren` checkpoint; predicts the same `(vis, t0, coeffs)` as the LUT on demand. |
+| SER kernel                   | ~10K samples  | 10 us duration at 1 ns tick, oversampled 10x internally                                        |
+| 162 PMT channels             | 81 per volume | x-reflection symmetry maps half-detector library to full coverage                              |
+
 
 ## Size Reference
 
 Benchmarked on `out.h5` (MPV/MPR events, ~180K deposits/event average), 15-bit digitization, oversample=10, no baseline noise, `--label-key interaction`:
 
-| Metric | Value |
-|---|---|
-| Per event | ~6 MB |
-| Per 1000 events | ~6 GB |
-| Typical PE count | ~1.3M PEs/event |
-| Typical interactions/event | ~15 |
-| Typical chunks | ~2,500/event |
+
+| Metric                     | Value           |
+| -------------------------- | --------------- |
+| Per event                  | ~6 MB           |
+| Per 1000 events            | ~6 GB           |
+| Typical PE count           | ~1.3M PEs/event |
+| Typical interactions/event | ~15             |
+| Typical chunks             | ~2,500/event    |
+
 
 ## Threading Architecture
 
@@ -260,8 +325,9 @@ Only CPU work runs in this thread — all GPU work (JAX light generation, PyTorc
 ### 2. Main thread (GPU)
 
 Runs all GPU computation sequentially:
+
 - **jaxtpc** `process_event_light` (JAX) — photon yield calculation (~0.02s)
-- **voxelize_labeled** (torch on GPU, optional) — JAX → torch via dlpack (zero-copy), then per-label `torch.unique` + `index_add_` (~20 ms when `--voxel-dx > 0`, dominated by the per-label Python loop; 0 when off)
+- **voxelize_labeled** (torch on GPU, optional) — JAX → torch via dlpack (zero-copy), then per-label `torch.unique` + `index_add`_ (~20 ms when `--voxel-dx > 0`, dominated by the per-label Python loop; 0 when off)
 - **GOOP** `simulate` (PyTorch) — TOF sampling, delays, histogramming, FFT convolution
 - GPU → CPU tensor transfer before queuing to save workers
 
@@ -276,12 +342,14 @@ Background threads that pull completed events from a bounded queue and write the
 
 ### Tuning `--workers`
 
-| Workers | Behavior | When to use |
-|---|---|---|
-| 0 | Serial — save blocks the main thread (~3s/event overhead) | Debugging, minimal memory |
-| 1 | Single background saver — hides most save latency | Low-memory systems |
-| 2 | Default — 2 savers overlap with GPU work | Recommended |
-| 3+ | Diminishing returns — HDF5 writes serialize through the lock | Not recommended |
+
+| Workers | Behavior                                                     | When to use               |
+| ------- | ------------------------------------------------------------ | ------------------------- |
+| 0       | Serial — save blocks the main thread (~3s/event overhead)    | Debugging, minimal memory |
+| 1       | Single background saver — hides most save latency            | Low-memory systems        |
+| 2       | Default — 2 savers overlap with GPU work                     | Recommended               |
+| 3+      | Diminishing returns — HDF5 writes serialize through the lock | Not recommended           |
+
 
 ## Performance
 
@@ -289,15 +357,17 @@ Benchmarked on NVIDIA A100-SXM4-40GB, `--label-key interaction`, `--workers 2`, 
 
 ### Sampler × voxelization sweep (avg per-event wall-clock)
 
-| Stage | LUT | LUT, 10 mm voxels | SIREN | SIREN, 10 mm voxels |
-|---|---|---|---|---|
-| Load (HDF5 read)            | 0.05 s | 0.05 s | 0.05 s | 0.05 s |
-| Light generation (jaxtpc)   | 0.01 s | 0.01 s | 0.01 s | 0.01 s |
-| Voxelization (per-label)    | —      | 0.02 s | —      | 0.02 s |
-| GOOP simulation             | 0.89 s | 0.74 s | 4.20 s | 1.04 s |
-| Save (queue put)            | 0.01 s | 0.01 s | 0.01 s | 0.01 s |
-| Loop overhead (gc + queue drain) | 0.30 s | 0.14 s | 0.28 s | 0.14 s |
-| **Total / event**           | **1.26 s** | **0.97 s** | **4.56 s** | **1.27 s** |
+
+| Stage                            | LUT        | LUT, 10 mm voxels | SIREN      | SIREN, 10 mm voxels |
+| -------------------------------- | ---------- | ----------------- | ---------- | ------------------- |
+| Load (HDF5 read)                 | 0.05 s     | 0.05 s            | 0.05 s     | 0.05 s              |
+| Light generation (jaxtpc)        | 0.01 s     | 0.01 s            | 0.01 s     | 0.01 s              |
+| Voxelization (per-label)         | —          | 0.02 s            | —          | 0.02 s              |
+| GOOP simulation                  | 0.89 s     | 0.74 s            | 4.20 s     | 1.04 s              |
+| Save (queue put)                 | 0.01 s     | 0.01 s            | 0.01 s     | 0.01 s              |
+| Loop overhead (gc + queue drain) | 0.30 s     | 0.14 s            | 0.28 s     | 0.14 s              |
+| **Total / event**                | **1.26 s** | **0.97 s**        | **4.56 s** | **1.27 s**          |
+
 
 At `--voxel-dx 10` the per-event voxel count drops from ~95k–264k raw segments to ~6k–21k voxels; with 1 ns ticks, the final waveform is preserved exactly.
 

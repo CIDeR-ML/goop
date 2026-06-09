@@ -58,10 +58,11 @@ DEFAULT_DELAY_CHAIN = [
 DEFAULT_RUN_CONFIG = {
     "run": {
         "data": "out.h5",
+        "start_event": 0,
         "events": None,
         "events_per_file": 1000,
         "label_key": "interaction",
-        "label_dist": "Uniform",
+        "label_dist": "All",
         "seed": 42,
         "align": False,
     },
@@ -73,6 +74,9 @@ DEFAULT_RUN_CONFIG = {
     "output": {
         "dataset": "sim",
         "outdir": ".",
+        "file_index_offset": 0,
+        "overwrite": False,
+        "skip_existing": False,
         "workers": 2,
     },
     "digitization": {
@@ -86,7 +90,7 @@ DEFAULT_RUN_CONFIG = {
         "tick_ns": 1.0,
         "oversample": 10,
         "voxel_dx": 0.0,
-        "time_window_ns": 10000,
+        "time_window_ns": 0,
         "ser_jitter_std": 0.1,
         "baseline_noise_std": 0.0,
         "kernel_duration_ns": 10000,
@@ -121,9 +125,9 @@ DEFAULT_SAMPLER_CONFIGS = {
 SECTION_KEYS = set(DEFAULT_RUN_CONFIG)
 
 SECTION_ALLOWED_KEYS = {
-    "run": {"data", "events", "events_per_file", "label_key", "label_dist", "seed", "align"},
+    "run": {"data", "start_event", "events", "events_per_file", "label_key", "label_dist", "seed", "align"},
     "detector": {"config", "total_pad", "response_chunk_size"},
-    "output": {"dataset", "outdir", "workers"},
+    "output": {"dataset", "outdir", "file_index_offset", "overwrite", "skip_existing", "workers"},
     "digitization": {"enabled", "n_bits", "pedestal", "max_pe_per_pmt"},
     "optical": {
         "device",
@@ -141,6 +145,7 @@ LEGACY_KEY_MAP = {
     "data": ("run", "data"),
     "input": ("run", "data"),
     "input_h5": ("run", "data"),
+    "start_event": ("run", "start_event"),
     "events": ("run", "events"),
     "events_per_file": ("run", "events_per_file"),
     "label_key": ("run", "label_key"),
@@ -157,6 +162,9 @@ LEGACY_KEY_MAP = {
     "outdir": ("output", "outdir"),
     "output": ("output", "outdir"),
     "output_dir": ("output", "outdir"),
+    "file_index_offset": ("output", "file_index_offset"),
+    "overwrite": ("output", "overwrite"),
+    "skip_existing": ("output", "skip_existing"),
     "workers": ("output", "workers"),
     "n_bits": ("digitization", "n_bits"),
     "pedestal": ("digitization", "pedestal"),
@@ -487,6 +495,7 @@ def flatten_config_for_argparse(config: Mapping[str, Any]) -> dict[str, Any]:
         "config": detector["config"],
         "dataset": output["dataset"],
         "outdir": output["outdir"],
+        "start_event": run["start_event"],
         "events": run["events"],
         "events_per_file": run["events_per_file"],
         "label_key": run["label_key"],
@@ -515,6 +524,9 @@ def flatten_config_for_argparse(config: Mapping[str, Any]) -> dict[str, Any]:
         "siren_ckpt_path": sampler.get("ckpt_path"),
         "siren_cfg_path": sampler.get("cfg_path"),
         "sirentv_src": sampler.get("sirentv_src"),
+        "file_index_offset": output["file_index_offset"],
+        "overwrite": output["overwrite"],
+        "skip_existing": output["skip_existing"],
         "workers": output["workers"],
         "seed": run["seed"],
         "align": run["align"],

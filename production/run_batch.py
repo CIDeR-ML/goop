@@ -69,10 +69,47 @@ def get_num_events(data_path):
     with h5py.File(data_path, 'r') as f:
         return f['pstep/lar_vol'].shape[0]
 
+def output_file_complete(path, expected_events, expected_event_offset=None,
+                         expected_source_file=None):
+    """Return True when an existing output file looks complete."""
+    try:
+        with h5py.File(path, 'r') as f:
+            if 'config' not in f:
+                return False
+            attrs = f['config'].attrs
+            if int(attrs.get('n_events', -1)) != int(expected_events):
+                return False
+            if expected_event_offset is not None:
+                if int(attrs.get('global_event_offset', -1)) != int(expected_event_offset):
+                    return False
+            if expected_source_file is not None:
+                source_file = attrs.get('source_file', '')
+                if isinstance(source_file, bytes):
+                    source_file = source_file.decode()
+                if str(source_file) != str(expected_source_file):
+                    return False
+            event_keys = [k for k in f.keys() if k.startswith('event_')]
+            return len(event_keys) == int(expected_events)
+    except OSError:
+        return False
+
 def get_num_labels(dist:torch.distributions.Distribution):
     if dist is None:
-        return 10
+        return None
+    if isinstance(dist, int):
+        return dist
     return round(dist.sample((1,)).item())
+
+def time_window_enabled(time_window_ns):
+    return time_window_ns is not None and time_window_ns > 0
+
+def seed_for_event(base_seed, event_idx):
+    """Seed host/CUDA Torch and NumPy from the absolute source event index."""
+    seed = int(base_seed) + int(event_idx)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed % (2**32))
 
 LABEL_FIELDS = {
     'volume': None,           # synthetic: filled with volume index
@@ -164,7 +201,7 @@ def voxelize_labeled(pos_mm, n_photons, t_step_ns, labels, dx,
         mask = lbl == unique_lbl
         if not bool(mask.any()):
             continue
-        p_v, n_v, t_v = voxelize(pos[mask], nph[mask], tns[mask], lbl[mask], dx=dx)
+        p_v, n_v, t_v = voxelize(pos[mask], nph[mask], tns[mask], dx=dx)
         pv_all.append(p_v)
         npv_all.append(n_v)
         tv_all.append(t_v)
@@ -202,6 +239,8 @@ def build_parser(defaults=None):
     parser.add_argument('--dataset', default=defaults['dataset'],
                         help='Dataset name prefix for output files')
     parser.add_argument('--outdir', default=defaults['outdir'], help='Output directory')
+    parser.add_argument('--start-event', type=int, default=defaults['start_event'],
+                        help='Absolute source event index to start from (default: 0)')
     parser.add_argument('--events', type=int, default=defaults['events'],
                         help='Number of events (default: all)')
     parser.add_argument('--events-per-file', type=int,
@@ -212,7 +251,7 @@ def build_parser(defaults=None):
                         help='Deposit label for per-waveform separation '
                              '(default: interaction)')
     parser.add_argument('--label-dist', default=defaults['label_dist'],
-                        choices=['Uniform', 'Poisson', 'HalfNormal', 'Fixed'],
+                        choices=['All', 'Uniform', 'Poisson', 'HalfNormal', 'Fixed'],
                         help='Distribution for label sampling (default: Uniform)')
     # Digitization
     parser.add_argument('--n-bits', type=int, default=defaults['n_bits'],
@@ -300,6 +339,23 @@ def build_parser(defaults=None):
                              'is performed per-label group so per-waveform label '
                              'separation is preserved. 0 disables (default).')
     # Other
+    parser.add_argument('--file-index-offset', type=int,
+                        default=defaults['file_index_offset'],
+                        help='Output file index for the first produced shard '
+                             '(default: 0)')
+    parser.add_argument('--overwrite', dest='overwrite',
+                        action='store_true', default=defaults['overwrite'],
+                        help='Replace existing output files after a successful '
+                             'temporary-file write')
+    parser.add_argument('--no-overwrite', dest='overwrite',
+                        action='store_false',
+                        help='Fail if an output file already exists')
+    parser.add_argument('--skip-existing', '--resume', dest='skip_existing',
+                        action='store_true', default=defaults['skip_existing'],
+                        help='Skip existing complete output files')
+    parser.add_argument('--no-skip-existing', dest='skip_existing',
+                        action='store_false',
+                        help='Do not skip existing files')
     parser.add_argument('--workers', type=int, default=defaults['workers'],
                         help='Number of save worker threads (0=serial, default: 2)')
     parser.add_argument('--seed', type=int, default=defaults['seed'])
@@ -317,6 +373,7 @@ CLI_OVERRIDE_SPECS = [
     ('config', 'config', ['--config']),
     ('dataset', 'dataset', ['--dataset']),
     ('outdir', 'outdir', ['--outdir']),
+    ('start_event', 'start_event', ['--start-event']),
     ('events', 'events', ['--events']),
     ('events_per_file', 'events_per_file', ['--events-per-file']),
     ('label_key', 'label_key', ['--label-key']),
@@ -340,6 +397,7 @@ CLI_OVERRIDE_SPECS = [
     ('siren_ckpt_path', 'siren_ckpt_path', ['--siren-ckpt-path']),
     ('siren_cfg_path', 'siren_cfg_path', ['--siren-cfg-path']),
     ('sirentv_src', 'sirentv_src', ['--sirentv-src']),
+    ('file_index_offset', 'file_index_offset', ['--file-index-offset']),
     ('workers', 'workers', ['--workers']),
     ('seed', 'seed', ['--seed']),
 ]
@@ -378,6 +436,10 @@ def _collect_cli_overrides(args, argv):
 
     if _option_present(argv, ['--align', '--no-align']):
         overrides['align'] = args.align
+    if _option_present(argv, ['--overwrite', '--no-overwrite']):
+        overrides['overwrite'] = args.overwrite
+    if _option_present(argv, ['--skip-existing', '--resume', '--no-skip-existing']):
+        overrides['skip_existing'] = args.skip_existing
 
     return overrides
 
@@ -417,26 +479,54 @@ def main(argv=None):
     n_bits = digitization['n_bits']
     pedestal = digitization['pedestal']
     gain = digitization['gain']
+    start_event = args.start_event
     events_per_file = args.events_per_file
+    file_index_offset = args.file_index_offset
     dataset_name = args.dataset
     label_key = args.label_key
     label_dist = args.label_dist
     should_align = args.align
     time_window_ns = args.time_window_ns
+    use_time_window = time_window_enabled(time_window_ns)
+
+    if start_event < 0:
+        raise ValueError(f'--start-event must be >= 0, got {start_event}')
+    if events_per_file <= 0:
+        raise ValueError(f'--events-per-file must be > 0, got {events_per_file}')
+    if file_index_offset < 0:
+        raise ValueError(f'--file-index-offset must be >= 0, got {file_index_offset}')
+    if args.overwrite and args.skip_existing:
+        raise ValueError('--overwrite and --skip-existing are mutually exclusive')
 
     total_events = get_num_events(args.data)
-    num_events = min(args.events, total_events) if args.events else total_events
+    if start_event > total_events:
+        raise ValueError(
+            f'--start-event {start_event} is beyond input size {total_events}')
+    remaining_events = total_events - start_event
+    if args.events is None:
+        num_events = remaining_events
+    else:
+        if args.events < 0:
+            raise ValueError(f'--events must be >= 0, got {args.events}')
+        num_events = min(args.events, remaining_events)
     num_files = (num_events + events_per_file - 1) // events_per_file
 
+    if num_events == 0:
+        print(f'No events to process: start_event={start_event}, '
+              f'requested_events={args.events}, total_events={total_events}')
+        return
 
-    if label_dist == 'Uniform':
+
+    if label_dist == 'All':
+        label_dist = None
+    elif label_dist == 'Uniform':
         label_dist = Uniform(low=1, high=15)
     elif label_dist == 'Poisson':
         label_dist = Poisson(lam=10)
     elif label_dist == 'HalfNormal':
         label_dist = HalfNormal(scale=10)
     elif label_dist == 'Fixed':
-        label_dist = None
+        label_dist = 10
     else:
         raise ValueError(f'Invalid label distribution: {label_dist}')
     
@@ -452,10 +542,13 @@ def main(argv=None):
     if args.run_config:
         print(f'  Run config:     {args.run_config}')
     print(f'  Data:           {args.data} ({num_events}/{total_events} events)')
+    print(f'  Event range:    {start_event}-{start_event + num_events - 1}')
     print(f'  Dataset:        {dataset_name}')
     print(f'  Label key:      {label_key}')
     print(f'  Events/file:    {events_per_file}')
     print(f'  Num files:      {num_files}')
+    print(f'  File index base:{file_index_offset:>5}')
+    print(f'  Existing files: {"overwrite" if args.overwrite else "skip complete" if args.skip_existing else "fail"}')
     print(f'  Digitization:   {"ON" if include_digitize else "OFF"}')
     if include_digitize:
         print(f'    n_bits:       {n_bits}')
@@ -479,7 +572,7 @@ def main(argv=None):
     print(f'  CUDA device:    {torch.cuda.get_device_name(0)}')
     print(f'  Output:         {optical_dir}/')
     print(f'  Label dist:     {label_dist}')
-    print(f'  Time window:    {time_window_ns} ns')
+    print(f'  Time window:    {f"{time_window_ns} ns" if use_time_window else "disabled"}')
     print()
 
     # ---- Create jaxtpc simulator (light-only) ----
@@ -505,11 +598,13 @@ def main(argv=None):
     # ---- Warmup ----
     print('  Warmup...', end='', flush=True)
     t_warmup = time.time()
-    warmup_dep = load_event(args.data, cfg, event_idx=0)
+    warmup_idx = min(start_event, total_events - 1)
+    seed_for_event(args.seed, warmup_idx)
+    warmup_dep = load_event(args.data, cfg, event_idx=warmup_idx)
     warmup_filled = jaxtpc_sim.process_event_light(warmup_dep)
     jax.block_until_ready(warmup_filled.volumes[0].charge)
     pos, nph, tns, lbl, pdg, des, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
-    if args.time_window_ns > 0:
+    if use_time_window:
         rand_time_tpcs_ns = throw_in_time_window(pos, nph, tns, lbl, time_window_ns=args.time_window_ns, pdgs=pdg, de=des)
         pos = rand_time_tpcs_ns["pos_mm"]
         nph = rand_time_tpcs_ns["n_photons"]
@@ -520,12 +615,12 @@ def main(argv=None):
     if args.voxel_dx > 0:
         pos_vox, nph_vox, tns_vox, lbl_vox = voxelize_labeled(pos, nph, tns, lbl, args.voxel_dx)
         warmup_wfs = goop_sim.simulate(
-            pos_vox, nph_vox, tns_vox, labels=lbl_vox, stitched=True, subtract_t0=False if args.time_window_ns > 0 else True
+            pos_vox, nph_vox, tns_vox, labels=lbl_vox, stitched=True, subtract_t0=not use_time_window
         )
         del warmup_dep, warmup_filled, warmup_wfs, pos, pos_vox, nph, nph_vox, tns, tns_vox, lbl, lbl_vox, pdg, des
     else:
         warmup_wfs = goop_sim.simulate(
-            pos, nph, tns, labels=lbl, stitched=True, subtract_t0=False if args.time_window_ns > 0 else True
+            pos, nph, tns, labels=lbl, stitched=True, subtract_t0=not use_time_window
         )        
         del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl, pdg, des
     gc.collect()
@@ -587,178 +682,211 @@ def main(argv=None):
 
     # ---- Process events ----
     total_start = time.time()
+    processed_events = 0
+    skipped_files = 0
 
     for file_idx in range(num_files):
-        event_start = file_idx * events_per_file
-        event_end = min(event_start + events_per_file, num_events)
+        output_file_idx = file_index_offset + file_idx
+        event_start = start_event + file_idx * events_per_file
+        event_end = min(event_start + events_per_file, start_event + num_events)
         n_in_file = event_end - event_start
 
         optical_path = os.path.join(
-            optical_dir, f'{dataset_name}_sensor_optical_{file_idx:04d}.h5')
+            optical_dir, f'{dataset_name}_sensor_optical_{output_file_idx:04d}.h5')
 
-        print(f'File {file_idx:04d}: events {event_start}\u2013{event_end-1} '
+        print(f'File {output_file_idx:04d}: events {event_start}\u2013{event_end-1} '
               f'({n_in_file} events)')
 
-        with h5py.File(optical_path, 'w') as f:
-            write_config_light(
-                f, goop_config,
-                label_key=label_key,
-                n_labels=cfg.n_volumes if label_key == 'volume' else 0,
-                dataset_name=dataset_name,
-                file_index=file_idx,
-                source_file=args.data,
-                pca_lut_path=pca_lut_path(run_config),
-                sampler_type=sampler_meta.get('type', ''),
-                sampler_config=sampler_meta,
-                delay_chain=delay_meta,
-                aux_photon_sources=aux_meta,
-                n_events=n_in_file,
-                global_event_offset=event_start,
-            )
+        if os.path.exists(optical_path):
+            if args.skip_existing:
+                if output_file_complete(
+                    optical_path, n_in_file,
+                    expected_event_offset=event_start,
+                    expected_source_file=args.data,
+                ):
+                    print(f'  skipping complete existing file: {optical_path}')
+                    skipped_files += 1
+                    continue
+                raise RuntimeError(
+                    f'Existing output is incomplete or unreadable: {optical_path}. '
+                    'Remove it or rerun with --overwrite.')
+            if not args.overwrite:
+                raise RuntimeError(
+                    f'Output already exists: {optical_path}. '
+                    'Use --skip-existing to resume or --overwrite to replace it.')
 
-            # Start workers
-            save_queue = None
-            workers = []
-            if num_workers > 0:
-                save_queue = queue.Queue(maxsize=num_workers + 2)
-                for _ in range(num_workers):
-                    t = threading.Thread(target=save_worker,
-                                         args=(f, save_queue), daemon=True)
-                    t.start()
-                    workers.append(t)
+        tmp_path = f'{optical_path}.tmp.{os.getpid()}.{int(time.time())}'
+        try:
+            with h5py.File(tmp_path, 'w') as f:
+                write_config_light(
+                    f, goop_config,
+                    label_key=label_key,
+                    n_labels=cfg.n_volumes if label_key == 'volume' else 0,
+                    dataset_name=dataset_name,
+                    file_index=output_file_idx,
+                    source_file=args.data,
+                    pca_lut_path=pca_lut_path(run_config),
+                    sampler_type=sampler_meta.get('type', ''),
+                    sampler_config=sampler_meta,
+                    delay_chain=delay_meta,
+                    aux_photon_sources=aux_meta,
+                    n_events=n_in_file,
+                    global_event_offset=event_start,
+                )
 
-            def prefetch_load(evt_idx):
-                """Load event from HDF5 (CPU-only, no GPU work)."""
-                return load_event(args.data, cfg, event_idx=evt_idx)
+                # Start workers
+                save_queue = None
+                workers = []
+                if num_workers > 0:
+                    save_queue = queue.Queue(maxsize=num_workers + 2)
+                    for _ in range(num_workers):
+                        t = threading.Thread(target=save_worker,
+                                             args=(f, save_queue), daemon=True)
+                        t.start()
+                        workers.append(t)
 
-            print(f"  {'Evt':>4} {'Segs':>16} {'Photons':>12} "
-                  f"{'Labels':>6} {'PEs':>10} {'Chunks':>7} "
-                  f"{'t_load':>6} {'t_light':>7} {'t_vox':>6} "
-                  f"{'t_goop':>6} {'t_save':>6} {'total':>6}")
-            print(f"  {'-' * 110}")
+                def prefetch_load(evt_idx):
+                    """Load event from HDF5 (CPU-only, no GPU work)."""
+                    return load_event(args.data, cfg, event_idx=evt_idx)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch:
-                # Submit first load immediately
-                future = prefetch.submit(prefetch_load, event_start)
+                print(f"  {'Evt':>4} {'Segs':>16} {'Photons':>12} "
+                      f"{'Labels':>6} {'PEs':>10} {'Chunks':>7} "
+                      f"{'t_load':>6} {'t_light':>7} {'t_vox':>6} "
+                      f"{'t_goop':>6} {'t_save':>6} {'total':>6}")
+                print(f"  {'-' * 110}")
 
-                for evt_idx in range(event_start, event_end):
-                    local_idx = evt_idx - event_start
-                    event_key = f'event_{local_idx:03d}'
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch:
+                    # Submit first load immediately
+                    future = prefetch.submit(prefetch_load, event_start)
 
-                    n_labels = get_num_labels(label_dist)
-                    goop_config.n_labels_to_simulate = n_labels
-                    goop_sim = OpticalSimulator(goop_config)
-                    print(f"  sampled {n_labels} interactions from {label_dist}")
-                    # 1. Collect prefetched deposits
-                    t0 = time.time()
-                    deposits = future.result()
-                    t_load = time.time() - t0
+                    for evt_idx in range(event_start, event_end):
+                        seed_for_event(args.seed, evt_idx)
+                        local_idx = evt_idx - event_start
+                        event_key = f'event_{local_idx:03d}'
 
-                    # 2. Submit prefetch for next event
-                    if evt_idx + 1 < event_end:
-                        future = prefetch.submit(prefetch_load, evt_idx + 1)
+                        n_labels = get_num_labels(label_dist)
+                        goop_config.n_labels_to_simulate = n_labels
+                        goop_sim = OpticalSimulator(goop_config)
+                        # if n_labels is None:
+                        #     print("  simulating all interactions")
+                        # else:
+                        #     print(f"  sampled {n_labels} interactions from {label_dist}")
+                        # 1. Collect prefetched deposits
+                        t0 = time.time()
+                        deposits = future.result()
+                        t_load = time.time() - t0
 
-                    # 3. jaxtpc light generation (GPU — kept in main thread)
-                    t0 = time.time()
-                    filled = jaxtpc_sim.process_event_light(deposits)
-                    jax.block_until_ready(filled.volumes[0].charge)
-                    t_light = time.time() - t0
+                        # 2. Submit prefetch for next event
+                        if evt_idx + 1 < event_end:
+                            future = prefetch.submit(prefetch_load, evt_idx + 1)
 
-                    # 4. Extract inputs & run GOOP
-                    t0 = time.time()
+                        # 3. jaxtpc light generation (GPU — kept in main thread)
+                        t0 = time.time()
+                        filled = jaxtpc_sim.process_event_light(deposits)
+                        jax.block_until_ready(filled.volumes[0].charge)
+                        t_light = time.time() - t0
 
-                    pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = extract_goop_inputs(
-                        filled, cfg, label_key)
+                        # 4. Extract inputs & run GOOP
+                        t0 = time.time()
 
-                    n_after = total_segs
-                    if args.time_window_ns > 0:
-                        rand_time_tpcs_ns = throw_in_time_window(pos_mm, n_ph, t_ns, labels, time_window_ns=args.time_window_ns, pdgs=pdgs, de=des)
-                        pos_mm = rand_time_tpcs_ns["pos_mm"]
-                        n_ph = rand_time_tpcs_ns["n_photons"]
-                        t_ns = rand_time_tpcs_ns["t_step"]
-                        labels = rand_time_tpcs_ns["labels"]
-                        pdgs = rand_time_tpcs_ns["pdgs"]
-                        des = rand_time_tpcs_ns["de"]
-                        n_after = pos_mm.shape[0]
+                        pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = extract_goop_inputs(
+                            filled, cfg, label_key)
 
-                    # Snapshot the post-window, pre-voxelization per-segment
-                    # arrays as numpy. These are the TPC inputs saved alongside
-                    # the simulated waveforms; voxelization is only a simulator
-                    # acceleration path.
-                    raw_pos = _as_numpy(pos_mm)
-                    raw_nph = _as_numpy(n_ph)
-                    raw_tns = _as_numpy(t_ns)
-                    raw_lbl = _as_numpy(labels)
-                    raw_pdg = _as_numpy(pdgs)
-                    raw_des = _as_numpy(des)
+                        n_after = total_segs
+                        if use_time_window:
+                            rand_time_tpcs_ns = throw_in_time_window(pos_mm, n_ph, t_ns, labels, time_window_ns=args.time_window_ns, pdgs=pdgs, de=des)
+                            pos_mm = rand_time_tpcs_ns["pos_mm"]
+                            n_ph = rand_time_tpcs_ns["n_photons"]
+                            t_ns = rand_time_tpcs_ns["t_step"]
+                            labels = rand_time_tpcs_ns["labels"]
+                            pdgs = rand_time_tpcs_ns["pdgs"]
+                            des = rand_time_tpcs_ns["de"]
+                            n_after = pos_mm.shape[0]
 
-                    sim_pos, sim_nph, sim_tns, sim_labels = pos_mm, n_ph, t_ns, labels
-                    t_vox = 0.0
-                    if args.voxel_dx > 0:
-                        tv0 = time.time()
-                        sim_pos, sim_nph, sim_tns, sim_labels = voxelize_labeled(
-                            pos_mm, n_ph, t_ns, labels, args.voxel_dx,
-                        )
-                        t_vox = time.time() - tv0
-                        n_after = sim_pos.shape[0]
-                    # Re-anchor t0 so t_goop_elapsed measures only goop_sim.simulate.
-                    t0 = time.time()
-                    waveforms = goop_sim.simulate(
-                        sim_pos, sim_nph, sim_tns, labels=sim_labels,
-                        stitched=True, subtract_t0=False if args.time_window_ns > 0 else True)
+                        # Snapshot the post-window, pre-voxelization per-segment
+                        # arrays as numpy. These are the TPC inputs saved alongside
+                        # the simulated waveforms; voxelization is only a simulator
+                        # acceleration path.
+                        raw_pos = _as_numpy(pos_mm)
+                        raw_nph = _as_numpy(n_ph)
+                        raw_tns = _as_numpy(t_ns)
+                        raw_lbl = _as_numpy(labels)
+                        raw_pdg = _as_numpy(pdgs)
+                        raw_des = _as_numpy(des)
 
-                    # 4.1 - Align Waveforms
-                    if should_align:
-                        waveforms = [wf.align() for wf in waveforms] # List[SlicedWaveform]
-                    
-                    t_goop_elapsed = time.time() - t0
+                        sim_pos, sim_nph, sim_tns, sim_labels = pos_mm, n_ph, t_ns, labels
+                        t_vox = 0.0
+                        if args.voxel_dx > 0:
+                            tv0 = time.time()
+                            sim_pos, sim_nph, sim_tns, sim_labels = voxelize_labeled(
+                                pos_mm, n_ph, t_ns, labels, args.voxel_dx,
+                            )
+                            t_vox = time.time() - tv0
+                            n_after = sim_pos.shape[0]
+                        # Re-anchor t0 so t_goop_elapsed measures only goop_sim.simulate.
+                        t0 = time.time()
+                        waveforms = goop_sim.simulate(
+                            sim_pos, sim_nph, sim_tns, labels=sim_labels,
+                            stitched=True, subtract_t0=not use_time_window)
 
-                    # Collect stats before CPU transfer
-                    n_labels_evt = len(waveforms)
-                    total_pe = sum(
-                        wvfm.attrs['pe_counts'].sum().item()
-                        for wvfm in waveforms)
-                    total_chunks = sum(wvfm.n_chunks for wvfm in waveforms)
-                    total_photons = int(sim_nph.sum())
+                        # 4.1 - Align Waveforms
+                        if should_align:
+                            waveforms = [wf.align() for wf in waveforms] # List[SlicedWaveform]
 
-                    # 4. GPU → CPU transfer + save (serial or queued)
-                    t0 = time.time()
-                    waveforms_cpu = waveforms_to_cpu(waveforms)
-                    item = (event_key, waveforms_cpu, evt_idx,
-                            raw_pos, raw_nph, raw_tns, raw_lbl, raw_des, raw_pdg)
+                        t_goop_elapsed = time.time() - t0
 
-                    if num_workers > 0:
-                        save_queue.put(item)
-                    else:
-                        save_one_event_with_tpc(f, item)
-                    t_save = time.time() - t0
+                        # Collect stats before CPU transfer
+                        n_labels_evt = len(waveforms)
+                        total_pe = sum(
+                            wvfm.attrs['pe_counts'].sum().item()
+                            for wvfm in waveforms)
+                        total_chunks = sum(wvfm.n_chunks for wvfm in waveforms)
+                        total_photons = int(sim_nph.sum())
 
-                    t_total = t_load + t_light + t_vox + t_goop_elapsed + t_save
+                        # 4. GPU → CPU transfer + save (serial or queued)
+                        t0 = time.time()
+                        waveforms_cpu = waveforms_to_cpu(waveforms)
+                        item = (event_key, waveforms_cpu, evt_idx,
+                                raw_pos, raw_nph, raw_tns, raw_lbl, raw_des, raw_pdg)
 
-                    segs_str = (f'{total_segs:,}->{n_after:,}'
-                                if args.voxel_dx > 0 else f'{total_segs:,}')
-                    print(f"  {evt_idx:>4} {segs_str:>16} "
-                          f"{total_photons:>12,} "
-                          f"{n_labels_evt:>6} {total_pe:>10,} "
-                          f"{total_chunks:>7,} "
-                          f"{t_load:>5.2f}s {t_light:>6.2f}s "
-                          f"{t_vox:>5.2f}s "
-                          f"{t_goop_elapsed:>5.2f}s {t_save:>5.2f}s "
-                          f"{t_total:>5.1f}s")
+                        if num_workers > 0:
+                            save_queue.put(item)
+                        else:
+                            save_one_event_with_tpc(f, item)
+                        t_save = time.time() - t0
 
-                    del deposits, filled, waveforms, waveforms_cpu
-                    del pos_mm, n_ph, t_ns, labels, pdgs, des
-                    del sim_pos, sim_nph, sim_tns, sim_labels
-                    del raw_pos, raw_nph, raw_tns, raw_lbl, raw_pdg, raw_des
-                    gc.collect()
+                        t_total = t_load + t_light + t_vox + t_goop_elapsed + t_save
 
-            # Wait for workers to finish
-            if num_workers > 0:
-                save_queue.join()
-                for _ in range(num_workers):
-                    save_queue.put(None)
-                for t in workers:
-                    t.join()
+                        segs_str = (f'{total_segs:,}->{n_after:,}'
+                                    if args.voxel_dx > 0 else f'{total_segs:,}')
+                        print(f"  {evt_idx:>4} {segs_str:>16} "
+                              f"{total_photons:>12,} "
+                              f"{n_labels_evt:>6} {total_pe:>10,} "
+                              f"{total_chunks:>7,} "
+                              f"{t_load:>5.2f}s {t_light:>6.2f}s "
+                              f"{t_vox:>5.2f}s "
+                              f"{t_goop_elapsed:>5.2f}s {t_save:>5.2f}s "
+                              f"{t_total:>5.1f}s")
+
+                        del deposits, filled, waveforms, waveforms_cpu
+                        del pos_mm, n_ph, t_ns, labels, pdgs, des
+                        del sim_pos, sim_nph, sim_tns, sim_labels
+                        del raw_pos, raw_nph, raw_tns, raw_lbl, raw_pdg, raw_des
+                        gc.collect()
+
+                # Wait for workers to finish
+                if num_workers > 0:
+                    save_queue.join()
+                    for _ in range(num_workers):
+                        save_queue.put(None)
+                    for t in workers:
+                        t.join()
+
+            os.replace(tmp_path, optical_path)
+            processed_events += n_in_file
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
         # File size
         optical_mb = os.path.getsize(optical_path) / (1024 * 1024)
@@ -768,9 +896,11 @@ def main(argv=None):
 
     total_elapsed = time.time() - total_start
     print(f'{"=" * 60}')
-    print(f'  Done. {num_events} events in {total_elapsed:.1f}s')
-    print(f'  Average: {total_elapsed/num_events:.2f}s/event')
-    print(f'  Files:   {num_files} in {optical_dir}/')
+    print(f'  Done. planned={num_events} processed={processed_events} '
+          f'skipped_files={skipped_files} in {total_elapsed:.1f}s')
+    if processed_events:
+        print(f'  Average: {total_elapsed/processed_events:.2f}s/event processed')
+    print(f'  Files:   {num_files} planned in {optical_dir}/')
     print(f'{"=" * 60}')
 
 

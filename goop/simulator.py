@@ -53,7 +53,8 @@ class OpticalSimConfig:
         self.n_channels = self.tof_sampler.n_channels * self.n_modules
         if isinstance(self.delays, list):
             self.delays = Delays(self.delays)
-        self.n_labels_to_simulate = min(self.n_labels_to_simulate, 30)
+        if self.n_labels_to_simulate is not None:
+            self.n_labels_to_simulate = min(self.n_labels_to_simulate, 30)
 
 class OpticalSimulator:
     """Full optical TPC simulation pipeline."""
