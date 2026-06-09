@@ -22,6 +22,43 @@ edepsim steps (position, dE, t)
 SlicedWaveform (compressed) or Waveform (full)
 ```
 
+## Install
+
+The repository is run directly from source. The only required submodule is
+`jaxtpc`.
+
+```bash
+git clone --recursive <repo-url> goop
+cd goop
+
+# If the clone was made without --recursive:
+git submodule update --init --recursive
+
+conda env create -f environment.yml
+conda activate goop
+
+export PYTHONPATH="$PWD:$PWD/jaxtpc:${PYTHONPATH:-}"
+python production/preflight.py --skip-assets --skip-gpu
+```
+
+For a production run on a new cluster, pass local input/output paths to the
+portable config:
+
+```bash
+python production/preflight.py \
+    --run-config production/configs/portable_template.yml \
+    --data /cluster/path/to/edepsim_input.h5 \
+    --plib-path /cluster/path/to/compressed_photon_library.h5 \
+    --outdir /cluster/path/to/goop_outputs
+
+python production/run_batch.py \
+    --run-config production/configs/portable_template.yml \
+    --data /cluster/path/to/edepsim_input.h5 \
+    --pca-lut-path /cluster/path/to/compressed_photon_library.h5 \
+    --outdir /cluster/path/to/goop_outputs \
+    --events 10
+```
+
 ## Quickstart
 
 ```python

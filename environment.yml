@@ -1,0 +1,19 @@
+name: goop
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - "numpy<2"
+  - scipy
+  - h5py
+  - pyyaml
+  - matplotlib
+  - tqdm
+  - pytest
+  - pytorch
+  - pytorch-cuda=12.1
+  - pip:
+      - "jax[cuda12]"

@@ -6,9 +6,13 @@ Batch optical simulation of particle events in a liquid argon TPC: jaxtpc photon
 
 ```
 production/
-├── run_batch.py         # Main batch simulation script
-├── load.py              # HDF5 load/decode functions
-└── README.md            # This file
+├── run_batch.py                 # Main batch simulation script
+├── preflight.py                 # Clone/environment/input checks
+├── slurm_array.sbatch           # Generic one-GPU Slurm array launcher
+├── configs/
+│   └── portable_template.yml    # Cluster-portable run config template
+├── load.py                      # HDF5 load/decode functions
+└── README.md                    # This file
 ```
 
 ## Usage
@@ -138,6 +142,53 @@ python3 production/run_batch.py \
     --dataset debug_10
 ```
 
+### Portable Cluster Setup
+
+For a fresh clone on a different cluster, initialize submodules, create the
+environment, point the portable template at local assets, and run preflight
+before submitting production jobs:
+
+```bash
+git clone --recursive <repo-url> goop
+cd goop
+
+conda env create -f environment.yml
+conda activate goop
+
+python production/preflight.py \
+    --run-config production/configs/portable_template.yml \
+    --data /cluster/path/to/edepsim_input.h5 \
+    --plib-path /cluster/path/to/compressed_photon_library.h5 \
+    --outdir /cluster/path/to/goop_outputs
+```
+
+If the clone was made without `--recursive`, run:
+
+```bash
+git submodule update --init --recursive
+```
+
+The portable template intentionally contains invalid `/path/to/...`
+placeholders. Either copy `production/configs/portable_template.yml` and edit
+the paths, or leave it unchanged and pass per-cluster overrides through normal
+CLI flags, `RUN_BATCH_EXTRA_ARGS`, or the preflight flags above.
+
+Useful smoke checks:
+
+```bash
+# Check imports/config/path wiring without requiring data assets or a visible GPU.
+python production/preflight.py --skip-assets --skip-gpu
+
+# Check the real production assets and GPU visibility.
+python production/preflight.py \
+    --data /cluster/path/to/edepsim_input.h5 \
+    --plib-path /cluster/path/to/compressed_photon_library.h5 \
+    --outdir /cluster/path/to/goop_outputs
+```
+
+The runner is not installed as a package. Submit and run from the repo root, or
+set `PYTHONPATH` to include both the repo root and `jaxtpc/`.
+
 ### Slurm Arrays
 
 Use `production/slurm_array.sbatch` for non-overlapping Slurm shards. Each
@@ -153,15 +204,18 @@ Example 1M-event launch with 1000 events per task:
 ```bash
 sbatch \
     --array=0-999 \
-    --export=ALL,GOOP_ENV_SETUP=/path/to/setup-goop-env.sh,EVENTS_PER_TASK=1000,EVENTS_PER_FILE=1000,RUN_CONFIG=production/configs/out_full_prod.yml \
+    --export=ALL,GOOP_ENV_SETUP=/path/to/setup-goop-env.sh,EVENTS_PER_TASK=1000,EVENTS_PER_FILE=1000,RUN_CONFIG=production/configs/portable_template.yml,RUN_BATCH_EXTRA_ARGS="--data /cluster/path/to/edepsim_input.h5 --pca-lut-path /cluster/path/to/compressed_photon_library.h5 --outdir /cluster/path/to/goop_outputs --dataset prod" \
     production/slurm_array.sbatch
 ```
 
 The template exports `PYTHONPATH` for this source tree, disables JAX prealloc by
-default, and runs `production/run_batch.py` with `--skip-existing`. Existing
-files are skipped only when `/config.attrs` report the expected source file,
-event count, and global event offset. Incomplete or mismatched files fail fast;
-rerun those shards with `--overwrite` after inspecting or removing the bad file.
+default, and runs `production/run_batch.py` with `--skip-existing`.
+`GOOP_ENV_SETUP` can source the site-specific environment module or conda
+activation. `PYTHON_BIN` defaults to `python` and can be overridden if the site
+requires an absolute interpreter path. Existing files are skipped only when
+`/config.attrs` report the expected source file, event count, and global event
+offset. Incomplete or mismatched files fail fast; rerun those shards with
+`--overwrite` after inspecting or removing the bad file.
 
 ### Full test_00_00_02 Run
 

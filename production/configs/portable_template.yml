@@ -1,0 +1,67 @@
+# Portable GOOP production template.
+#
+# Copy this file or pass CLI overrides at launch time. The placeholder paths
+# below are intentionally invalid so a fresh cluster run cannot accidentally use
+# SDF-local assets.
+
+run:
+  data: /path/to/edepsim_input.h5
+  start_event: 0
+  events: 10
+  events_per_file: 10
+  label_key: interaction
+  label_dist: All
+  seed: 42
+  align: false
+
+detector:
+  config: jaxtpc/config/cubic_pixel_config.yaml
+  total_pad: 900000
+  response_chunk_size: 9000
+
+output:
+  dataset: goop_portable
+  outdir: ./prod_runs/goop_portable
+  file_index_offset: 0
+  overwrite: false
+  skip_existing: false
+  workers: 2
+
+digitization:
+  enabled: true
+  n_bits: 15
+  pedestal: null
+  max_pe_per_pmt: 90000
+
+optical:
+  device: cuda
+  tick_ns: 1.0
+  oversample: 10
+  voxel_dx: 25.0
+  time_window_ns: null
+  ser_jitter_std: 0.1
+  baseline_noise_std: 0.0
+  kernel_duration_ns: 5000
+
+sampler:
+  type: lut
+  plib_path: /path/to/compressed_photon_library.h5
+  pmt_qe: 0.12
+  n_simulated: 30000000
+  lazy: false
+  interpolate: true
+  device: cuda:0
+
+delays:
+  enabled: true
+  chain:
+    - type: ScintillationBiexponentialDelay
+      singlet_fraction: 0.3
+      tau_singlet_ns: 6.0
+      tau_triplet_ns: 1300.0
+    - type: TPBTriexponentialDelay
+    - type: TTSDelay
+      fwhm_ns: 2.4
+      apply_transit_time: true
+
+aux_photon_sources: []
