@@ -30,12 +30,15 @@ from .kernels import (
     create_default_response,
 )
 from .noise import DarkNoise
+from . import sites
 from .sampler import (
     DifferentiableTOFSampler,
     PCATOFSampler,
+    QuantileTOFSampler,
     SirenTOFSampler,
     TOFSampler,
     create_default_tof_sampler,
+    create_quantile_tof_sampler,
     create_siren_tof_sampler,
 )
 from .simulator import OpticalSimConfig, OpticalSimulator
@@ -74,6 +77,9 @@ __all__ = [
     "PCATOFSampler",
     "TOFSampler",
     "SirenTOFSampler",
+    "QuantileTOFSampler",
+    "create_quantile_tof_sampler",
+    "sites",
     "create_default_tof_sampler",
     "create_siren_tof_sampler",
     "OpticalSimulator",

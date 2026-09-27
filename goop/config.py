@@ -23,6 +23,7 @@ from .sampler import (
     DEFAULT_N_SIMULATED,
     DEFAULT_PLIB_PATH,
     create_default_tof_sampler,
+    create_quantile_tof_sampler,
     create_siren_tof_sampler,
 )
 from .simulator import OpticalSimConfig
@@ -40,8 +41,10 @@ AUX_SOURCE_REGISTRY = {
 }
 
 SAMPLER_REGISTRY = {
-    "lut": create_default_tof_sampler,
-    "siren": create_siren_tof_sampler,
+    # The three legs of the LUT-vs-SIREN comparison, plus the site-default SIREN:
+    "lut": create_default_tof_sampler,              # PCA-compressed LUT
+    "quantile_lut": create_quantile_tof_sampler,    # quantile-native LUT
+    "siren": create_siren_tof_sampler,              # quantile-trained SIREN (q3)
 }
 
 DEFAULT_DELAY_CHAIN = [
@@ -113,12 +116,24 @@ DEFAULT_RUN_CONFIG = {
 
 DEFAULT_SAMPLER_CONFIGS = {
     "lut": DEFAULT_RUN_CONFIG["sampler"],
+    # No plib_path for the SIREN / quantile entries: each factory resolves the quantile
+    # library from goop.sites. Injecting DEFAULT_PLIB_PATH (the PCA library, as this used
+    # to) would hand the q3 network the wrong u-grid, voxel box and PMT normalization.
     "siren": {
         "type": "siren",
-        "plib_path": DEFAULT_PLIB_PATH,
         "n_simulated": DEFAULT_N_SIMULATED,
         "device": "cuda:0",
         "pmt_qe": 0.12,
+    },
+    "quantile_lut": {
+        "type": "quantile_lut",
+        "n_simulated": DEFAULT_N_SIMULATED,
+        "device": "cuda:0",
+        "interpolate": True,
+        "pmt_qe": 0.12,
+        # must equal the q3 training config's photonlib.combine_every_quantile so this
+        # leg sits on the same u-grid as the q3 SIREN
+        "combine_every_quantile": 2,
     },
 }
 

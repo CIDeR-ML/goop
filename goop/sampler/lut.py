@@ -12,12 +12,19 @@ import numpy as np
 import torch
 
 from ..base import TOFSamplerBase
-from .base import DEFAULT_N_SIMULATED, DEFAULT_PLIB_PATH, PCATOFSampler
+from .base import (
+    DEFAULT_N_SIMULATED,
+    DEFAULT_PLIB_PATH,
+    PCATOFSampler,
+    QuantileReconMixin,
+)
 
 __all__ = [
     "TOFSampler",
     "DifferentiableTOFSampler",
+    "QuantileTOFSampler",
     "create_default_tof_sampler",
+    "create_quantile_tof_sampler",
 ]
 
 
@@ -230,3 +237,156 @@ class TOFSampler(PCATOFSampler):
 # (including the regular ``TOFSampler``). External callers that reference
 # ``DifferentiableTOFSampler`` continue to work unchanged.
 DifferentiableTOFSampler = TOFSampler
+
+
+class QuantileTOFSampler(QuantileReconMixin, TOFSampler):
+    """Voxel-LUT sampler over a QUANTILE-native photon library.
+
+    The third leg of the SIREN-vs-LUT comparison: where ``TOFSampler`` reads a
+    PCA-compressed plib (`coeffs` + `pca_components`) and reconstructs the quantile
+    function from 50 components, this reads the stored quantile function directly.
+
+    Differences from the parent, all forced by the quantile file layout:
+      * the per-voxel tensor is ``quantiles`` (n_voxels, P, 512), not ``coeffs``
+      * t0 lives in ``analytical_t0`` and may be stored as integer TICKS rather than ns
+        it is converted here using tick = t_max_ns / n_bins
+      * the quantile axis is strided by ``combine_every_quantile``
+
+    Trilinear blending happens in the stored (log-quantile) domain, before the 10**x
+    decode.
+    """
+
+    def __init__(
+        self,
+        filepath,
+        n_simulated=DEFAULT_N_SIMULATED,
+        device="cpu",
+        interpolate=True,
+        pmt_qe=None,
+        combine_every_quantile=1,
+        verbose=True,
+    ):
+        dev = torch.device(device)
+        self._lazy = True          # not negotiable, see class docstring
+        self._interpolate = interpolate
+        self._file = None
+        self._cq = max(1, int(combine_every_quantile))
+
+        basis = PCATOFSampler._read_h5_basis(filepath, combine_every_quantile=self._cq)
+        if basis["has_pca"]:
+            # Not an error -- a PCA plib also carries `quantiles` in some productions --
+            # but the user probably wanted the PCA leg, so say which one they got.
+            if verbose:
+                print(
+                    "[QuantileTOFSampler] note: this file also has a PCA basis; reading "
+                    "the raw `quantiles` dataset and ignoring it. Use TOFSampler for the "
+                    "PCA-reconstructed leg."
+                )
+        self._init_common(
+            device=dev,
+            n_simulated=n_simulated,
+            pmt_qe=float(pmt_qe) if pmt_qe is not None else 1.0,
+            n_pmts=basis["n_pmts"],
+            n_components=basis["n_components"],   # = Q after striding
+            log_quantile_C=basis["log_quantile_C"],
+            t_max_ns=basis["t_max_ns"],
+            mode=basis["mode"],
+            pca_mean=None,          # quantile-native: no basis to expand against
+            pca_components=None,
+            u_grid=basis["u_grid"],
+            numvox=basis["numvox"],
+            min_xyz=basis["min_xyz"],
+            max_xyz=basis["max_xyz"],
+        )
+        self._n_voxels = basis["n_voxels"]
+        self.vis = self.t0 = self.coeffs = None   # lazy: always fetched from the file
+
+        self._file = h5py.File(filepath, "r", swmr=True, libver="latest")
+        if "quantiles" not in self._file:
+            raise KeyError(f"{filepath} has no 'quantiles' dataset")
+        self._t0_dset = "analytical_t0" if "analytical_t0" in self._file else "t0"
+
+        # t0 units: sirentv treats t0 as ns when the `t0_in_ns` attr is set, when mode is
+        # "quantile", or when the stored dtype is floating point; otherwise it is an
+        # integer tick index that must be scaled by the bin width.
+        n_bins = int(self._file.attrs.get("n_bins", 1000))
+        self._tick_ns = float(basis["t_max_ns"]) / max(1, n_bins)
+        self._t0_in_ns = bool(
+            self._file.attrs.get("t0_in_ns", False)
+            or basis["mode"] == "quantile"
+            or self._file[self._t0_dset].dtype.kind == "f"
+        )
+        if verbose:
+            print(
+                f"[QuantileTOFSampler] Q={basis['n_components']} "
+                f"(combine_every_quantile={self._cq}), mode={basis['mode']}, "
+                f"t0 from '{self._t0_dset}' in "
+                f"{'ns' if self._t0_in_ns else f'ticks x {self._tick_ns:.4g} ns'}"
+            )
+
+    def _fetch(self, voxel_ids):
+        """voxel_ids: (N,) -> vis (N, P), t0_ns (N, P), quantiles (N, P, Q).
+
+        Mirrors the parent's lazy path (unique + fancy-index + invert) but reads the
+        quantile tensor, strides it, and converts t0 to ns.
+        """
+        ids_np = voxel_ids.cpu().numpy()
+        uniq, inv = np.unique(ids_np, return_inverse=True)
+        v = torch.from_numpy(self._file["vis"][uniq]).float()                 # (U, P)
+        t_raw = self._file[self._t0_dset][uniq]                               # (U, P)
+        q = torch.from_numpy(
+            self._file["quantiles"][uniq][:, :, ::self._cq]
+        ).float()                                                             # (U, P, Q)
+
+        t = torch.from_numpy(np.asarray(t_raw)).float()
+        if not self._t0_in_ns:
+            t = t.clamp(min=0) * self._tick_ns
+
+        inv_t = torch.from_numpy(inv).long()
+        return (
+            v[inv_t].to(self._device),
+            t[inv_t].to(self._device),
+            q[inv_t].to(self._device),
+        )
+
+
+def create_quantile_tof_sampler(**kwargs) -> QuantileTOFSampler:
+    """Factory for the quantile-LUT leg. `plib_path` defaults to the site's quantile
+    library; pass `combine_every_quantile`."""
+    from ..sites import paths as _site_paths
+
+    plib_path = kwargs.pop("plib_path", kwargs.pop("filepath", None))
+    if not plib_path:
+        plib_path = _site_paths()["quantile_plib"]
+        if not plib_path:
+            raise ValueError(
+                "no quantile library configured for this site -- pass plib_path= or add "
+                "one to goop/sites.py"
+            )
+    defaults = {
+        "n_simulated": DEFAULT_N_SIMULATED,
+        "device": "cuda:0",
+        "interpolate": True,
+        "pmt_qe": 0.12,
+    }
+    defaults.update(kwargs)
+    if "combine_every_quantile" not in kwargs:
+        defaults["combine_every_quantile"] = _q3_stride_or_1()
+    return QuantileTOFSampler(plib_path, **defaults)
+
+
+def _q3_stride_or_1():
+    """photonlib.combine_every_quantile from the site's train_cfg.yaml, else 1."""
+    import yaml
+    from ..sites import paths as _site_paths
+
+    cfg_path = _site_paths().get("train_cfg")
+    if not cfg_path:
+        return 1
+    try:
+        with open(cfg_path) as fh:
+            cfg = yaml.safe_load(fh)
+    except OSError:
+        return 1
+    plib_cfg = cfg.get("compressed_plib", cfg.get("photonlib", {})) or {}
+    return int(plib_cfg.get("combine_every_quantile", 1))

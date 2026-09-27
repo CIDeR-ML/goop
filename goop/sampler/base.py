@@ -17,12 +17,23 @@ from ..base import TOFSamplerBase
 
 __all__ = [
     "PCATOFSampler",
+    "QuantileReconMixin",
     "DEFAULT_PLIB_PATH",
     "DEFAULT_N_SIMULATED",
 ]
 
-DEFAULT_PLIB_PATH = "/sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5"
-DEFAULT_N_SIMULATED = 15_000_000
+def _default_plib_path():
+    """Site's PCA-compressed library, or the historical s3df literal if the site is
+    undetectable (so importing this module never fails on an unknown machine)."""
+    try:
+        from ..sites import paths
+        return paths()["pca_plib"]
+    except Exception:
+        return "/sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5"
+
+
+DEFAULT_PLIB_PATH = _default_plib_path()
+DEFAULT_N_SIMULATED = 30_000_000
 
 
 class PCATOFSampler(TOFSamplerBase):
@@ -74,8 +85,17 @@ class PCATOFSampler(TOFSamplerBase):
         self._log_quantile_C = float(log_quantile_C)
         self._t_max_ns = float(t_max_ns)
         self._mode = str(mode)
-        self.pca_mean = pca_mean.to(dtype=torch.float32, device=self._device)
-        self.pca_components = pca_components.to(dtype=torch.float32, device=self._device)
+        # None for a quantile-native library/model, and
+        # _quantile_times is overridden to skip the expansion (see QuantileReconMixin).
+        self.pca_mean = (
+            None if pca_mean is None
+            else pca_mean.to(dtype=torch.float32, device=self._device)
+        )
+        self.pca_components = (
+            None if pca_components is None
+            else pca_components.to(dtype=torch.float32, device=self._device)
+        )
+        self._has_pca = self.pca_components is not None
         self.u_grid = u_grid.to(dtype=torch.float32, device=self._device)
         self._du = torch.diff(self.u_grid, prepend=torch.zeros(1, device=self._device)) # (Q,) probability mass per bin
         self._cumdu = torch.cat([
@@ -93,39 +113,69 @@ class PCATOFSampler(TOFSamplerBase):
         self._max_xyz = max_xyz.to(dtype=torch.float64, device=self._device)
 
     @staticmethod
-    def _read_h5_basis(filepath):
-        """Read shared PCA-basis + voxel-grid + PMT positions from a compressed plib.
+    def _read_h5_basis(filepath, combine_every_quantile=1):
+        """Read shared basis + voxel-grid + PMT positions from a plib.
 
-        Returns a dict of ready-to-pass fields plus `pmt_pos` (np.ndarray) and
-        `n_voxels` (int). Does not load the per-voxel LUT tensors (vis/t0/coeffs).
+        Works for BOTH library flavours:
+          * PCA-compressed (`coeffs`, `pca_mean`, `pca_components`) -- the historical case
+          * quantile-native (`quantiles`, no PCA basis) -- returns `pca_mean=None`,
+            `pca_components=None` and takes `n_components` from the quantile axis
+
+        `combine_every_quantile` subsamples `u_grid` by that stride, matching what sirentv
+        does to BOTH the stored quantiles and the u_grid.
+
+        Returns a dict of ready-to-pass fields plus `pmt_pos` (np.ndarray), `n_voxels`
+        (int) and `has_pca` (bool). Does not load the per-voxel LUT tensors.
         """
+        c = max(1, int(combine_every_quantile))
         with h5py.File(filepath, "r") as f:
+            has_pca = "pca_components" in f and "pca_mean" in f
+            if "coeffs" in f:
+                n_components = int(f["coeffs"].shape[2])
+            elif "quantiles" in f:
+                # quantile-native: the "component" axis IS the (strided) quantile axis
+                n_components = int(f["quantiles"].shape[2]) // c
+            else:
+                raise KeyError(
+                    f"{filepath} has neither 'coeffs' nor 'quantiles' -- not a plib this "
+                    "sampler can read"
+                )
             return dict(
                 n_pmts=int(f["vis"].shape[1]),
-                n_components=int(f["coeffs"].shape[2]),
+                n_components=n_components,
                 log_quantile_C=float(f.attrs.get("log_quantile_C", 1e-2)),
                 t_max_ns=float(f.attrs.get("t_max_ns", 600.0)),
                 mode=str(f.attrs.get("mode", "log_quantile")),
-                pca_mean=torch.from_numpy(f["pca_mean"][:]).float(),
-                pca_components=torch.from_numpy(f["pca_components"][:]).float(),
-                u_grid=torch.from_numpy(f["u_grid"][:]).float(),
+                pca_mean=torch.from_numpy(f["pca_mean"][:]).float() if has_pca else None,
+                pca_components=(
+                    torch.from_numpy(f["pca_components"][:]).float() if has_pca else None
+                ),
+                u_grid=torch.from_numpy(f["u_grid"][::c]).float(),
                 numvox=torch.from_numpy(np.asarray(f["numvox"][:], dtype=np.int64)),
                 min_xyz=torch.from_numpy(np.asarray(f["min"][:], dtype=np.float64)),
                 max_xyz=torch.from_numpy(np.asarray(f["max"][:], dtype=np.float64)),
                 pmt_pos=np.asarray(f["pmt_pos"][:]) if "pmt_pos" in f else None,
                 n_voxels=int(f["vis"].shape[0]),
+                has_pca=has_pca,
             )
 
     # abstract lookup
-
     @abstractmethod
     def _lookup(self, pos: torch.Tensor):
         """Return (vis, t0, coeffs) for each position in `pos` (N, 3).
 
-        Shapes: vis (N, P), t0 (N, P), coeffs (N, P, K). Must be differentiable
-        with respect to `pos` if gradients are desired. Input positions are
-        assumed to be on the plib's half-detector side (x <= 0); callers handle
-        x-mirroring before invoking this method.
+        Abstract: this base class only holds the reconstruction and sampling
+        machinery, and each concrete sampler supplies the lookup -- TOFSampler and
+        QuantileTOFSampler by trilinear LUT interpolation (lut.py), SirenTOFSampler
+        by a network forward pass (siren.py). ABC refuses to instantiate a
+        subclass that does not define it.
+
+        Shapes: vis (N, P), t0 (N, P) in ns, coeffs (N, P, K) -- PCA coefficients,
+        or the raw (N, P, Q) quantile grid for samplers built on
+        QuantileReconMixin. Must be differentiable with respect to `pos` if
+        gradients are desired. Input positions are assumed to be on the plib's
+        half-detector side (x <= 0); callers handle x-mirroring before invoking
+        this method.
         """
 
     @property
@@ -195,13 +245,34 @@ class PCATOFSampler(TOFSamplerBase):
         path used by ``sample_pdf`` when ``q_stride > 1``.
 
         """
+        return self._raw_to_abs(self._expand_raw(coeffs, q_idx), t0)
+
+    def _expand_raw(self, coeffs, q_idx=None):
+        """PCA expansion: (M, K) coefficients -> (M, Q_eff) raw quantile values.
+
+        Overridden by QuantileReconMixin for models/libraries whose native
+        representation is already the quantile function.
+        """
+        if not self._has_pca:
+            raise RuntimeError(
+                "this sampler has no PCA basis (the plib is quantile-native). Use a "
+                "sampler built on QuantileReconMixin, which reconstructs without one."
+            )
         if q_idx is None:
             comp = self.pca_components  # (K, Q)
             mean = self.pca_mean         # (Q,)
         else:
             comp = self.pca_components.index_select(1, q_idx)
             mean = self.pca_mean.index_select(0, q_idx)
-        raw = coeffs @ comp + mean  # (M, Q_eff)
+        return coeffs @ comp + mean  # (M, Q_eff)
+
+    def _raw_to_abs(self, raw, t0):
+        """Invert the log-quantile transform and offset by t0. (M, Q_eff) -> (M, Q_eff).
+
+        Same formula and clamp as sirentv's QuantilePLib.to_linear_time /
+        reconstruct_aligned_cdf (10**raw - log_quantile_C, clipped at 0), so both sides of
+        a SIREN-vs-LUT comparison decode identically.
+        """
         if self._mode == "log_quantile":
             q = (torch.pow(10.0, raw) - self._log_quantile_C).clamp(min=0)
         else:
@@ -858,3 +929,19 @@ class PCATOFSampler(TOFSamplerBase):
             self.close()
         except Exception:
             pass
+
+
+class QuantileReconMixin:
+    """Mix in AHEAD of PCATOFSampler when the native representation is the quantile
+    function itself rather than PCA coefficients.
+
+    The `coeffs` slot of `_lookup`'s return value then carries (M, Q) raw quantile values:
+
+        class MySampler(QuantileReconMixin, PCATOFSampler): ...
+    """
+
+    def _expand_raw(self, coeffs, q_idx=None):
+        if q_idx is None:
+            return coeffs
+        # the quantile axis is last here, unlike the PCA basis whose Q axis is dim 1
+        return coeffs.index_select(-1, q_idx)
