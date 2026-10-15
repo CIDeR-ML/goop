@@ -10,7 +10,10 @@ import torch
 import torch.nn.functional as F
 
 from .digitize import digitize as _digitize
-from .waveform_utils import _next_fft_size, _slice_channel
+from .waveform_utils import _gather_rows, _next_fft_size, _slice_channel
+
+# Largest FFT batch, in elements (rows x FFT size), for SlicedWaveform.convolve.
+_FFT_BATCH_ELEMENTS = 1 << 25
 
 
 @dataclass
@@ -470,11 +473,11 @@ class SlicedWaveform:
         """
         conv_ticks = kernel.shape[0]
         device = self.adc.device
-        new_pieces: List[torch.Tensor] = []
+        n_chunks = self.n_chunks
+        new_pieces: List[torch.Tensor] = [None] * n_chunks
         new_offsets = [0]
-        k_fft_cache: dict = {}
 
-        if self.n_chunks > 0:
+        if n_chunks > 0:
             max_t0_per_pmt = torch.full(
                 (self.n_channels,), float("-inf"),
                 device=device, dtype=self.t0_ns.dtype,
@@ -487,20 +490,23 @@ class SlicedWaveform:
         else:
             is_last_cpu = []
 
-        for k in range(self.n_chunks):
-            chunk_data = self.adc[self.offsets[k]:self.offsets[k + 1]]
-            extend = conv_ticks - 1 if is_last_cpu[k] else 0
-            out_len = chunk_data.numel() + extend
-            n_fft = _next_fft_size(chunk_data.numel() + conv_ticks - 1)
-
-            if n_fft not in k_fft_cache:
-                k_fft_cache[n_fft] = torch.fft.rfft(kernel, n=n_fft)
-
-            padded = F.pad(chunk_data, (0, n_fft - chunk_data.numel()))
-            result = gain * torch.fft.irfft(
-                torch.fft.rfft(padded) * k_fft_cache[n_fft], n=n_fft
-            )
-            new_pieces.append(result[:out_len])
+        # Chunks sharing an FFT size are convolved together, a batch of rows at
+        # a time; the offsets come to the host once, not per chunk.
+        starts = self.offsets.tolist()
+        lengths = [b - a for a, b in zip(starts[:-1], starts[1:])]
+        out_lens = [n + (conv_ticks - 1 if last else 0) for n, last in zip(lengths, is_last_cpu)]
+        n_ffts = [_next_fft_size(n + conv_ticks - 1) for n in lengths]
+        for n_fft in sorted(set(n_ffts)):
+            k_fft = torch.fft.rfft(kernel, n=n_fft)
+            same = [k for k in range(n_chunks) if n_ffts[k] == n_fft]
+            rows_per_batch = max(1, _FFT_BATCH_ELEMENTS // n_fft)
+            for b in range(0, len(same), rows_per_batch):
+                batch = same[b:b + rows_per_batch]
+                padded = _gather_rows(self.adc, [starts[k] for k in batch], [lengths[k] for k in batch], n_fft)
+                result = gain * torch.fft.irfft(torch.fft.rfft(padded) * k_fft, n=n_fft)
+                for row, k in enumerate(batch):
+                    new_pieces[k] = result[row, :out_lens[k]]
+        for out_len in out_lens:
             new_offsets.append(new_offsets[-1] + out_len)
 
         # An empty input has no signal but the convolution support is still
@@ -527,21 +533,27 @@ class SlicedWaveform:
             return self
         coarse_tick = self.tick_ns * factor
         device = self.adc.device
-        new_pieces: List[torch.Tensor] = []
-        new_offsets = [0]
 
-        for k in range(self.n_chunks):
-            chunk = self.adc[self.offsets[k]:self.offsets[k + 1]]
-            remainder = chunk.numel() % factor
-            if remainder != 0:
-                chunk = F.pad(chunk, (0, factor - remainder))
-            coarse_chunk = chunk.reshape(-1, factor).mean(dim=1)
-            new_pieces.append(coarse_chunk)
-            new_offsets.append(new_offsets[-1] + coarse_chunk.numel())
+        # Each chunk zero-padded to whole coarse bins, all in one buffer, then
+        # averaged in groups of `factor`.
+        starts = self.offsets.tolist()
+        lengths = [b - a for a, b in zip(starts[:-1], starts[1:])]
+        new_offsets = [0]
+        for n in lengths:
+            new_offsets.append(new_offsets[-1] + -(-n // factor))
+        padded = torch.zeros(new_offsets[-1] * factor, device=device, dtype=self.adc.dtype)
+        total = starts[-1] - starts[0]
+        if total:
+            lens = torch.tensor(lengths, device=device)
+            within = torch.arange(total, device=device) - torch.repeat_interleave(
+                torch.tensor(starts[:-1], device=device) - starts[0], lens, output_size=total)
+            dest = torch.repeat_interleave(
+                torch.tensor(new_offsets[:-1], device=device) * factor, lens, output_size=total)
+            padded[dest + within] = self.adc[starts[0]:starts[-1]]
 
         new_n_bins = math.ceil(self.n_bins / factor) if self.n_bins is not None else None
         return SlicedWaveform(
-            adc=torch.cat(new_pieces) if new_pieces else torch.zeros(0, device=device),
+            adc=padded.reshape(-1, factor).mean(dim=1),
             offsets=torch.tensor(new_offsets, device=device, dtype=torch.long),
             t0_ns=self.t0_ns.clone(),
             pmt_id=self.pmt_id.clone(),
