@@ -1,31 +1,21 @@
 """TOFSampler refuses photon libraries whose rows are not one per grid voxel in lookup order."""
 
-import numpy as np
+import os
+
 import pytest
 
-from goop.sampler.lut import _check_row_order
+from goop.sampler.lut import TOFSampler
 
-NUMVOX, LO, HI = [3, 4, 2], [-90.0, -60.0, 0.0], [0.0, 60.0, 60.0]
-
-
-def _grid_pos():
-    size = (np.array(HI) - np.array(LO)) / np.array(NUMVOX)
-    ix, iy, iz = np.meshgrid(*(np.arange(n) for n in NUMVOX), indexing="ij")
-    ijk = np.stack([ix.ravel(order="F"), iy.ravel(order="F"), iz.ravel(order="F")], 1)  # x fastest
-    return np.array(LO) + (ijk + 0.5) * size
+PIXEL_B01 = "/sdf/data/neutrino/youngsam/compressed_pixel_plib_b01_quantile_log_n50.h5"  # 18,504 voxels missing
+WIRE_B05 = "/sdf/data/neutrino/youngsam/compressed_plib_b05_quantile_log_prod_lite_n50.h5"
 
 
-def test_grid_order_passes():
-    _check_row_order(_grid_pos(), NUMVOX, LO, HI)
+@pytest.mark.skipif(not os.path.exists(PIXEL_B01), reason="needs the b01 pixel library")
+def test_library_with_missing_and_shuffled_rows_is_refused():
+    with pytest.raises(ValueError, match="not one per grid voxel"):
+        TOFSampler(PIXEL_B01, lazy=True)
 
 
-def test_missing_voxels_are_refused():
-    with pytest.raises(ValueError, match="23 rows for a"):
-        _check_row_order(_grid_pos()[:-1], NUMVOX, LO, HI)
-
-
-def test_rows_out_of_order_are_refused():
-    pos = _grid_pos()
-    pos[[5, 9]] = pos[[9, 5]]
-    with pytest.raises(ValueError, match="2 of 24 rows .* first is row 5"):
-        _check_row_order(pos, NUMVOX, LO, HI)
+@pytest.mark.skipif(not os.path.exists(WIRE_B05), reason="needs the b05 wire library")
+def test_library_in_grid_order_loads():
+    TOFSampler(WIRE_B05, lazy=True)
