@@ -76,6 +76,10 @@ class TOFSampler(PCATOFSampler):
                 max_xyz=basis["max_xyz"],
             )
             self._n_voxels = basis["n_voxels"]
+            # A lookup reads row _coord_to_voxel(pos), so the rows must be every grid voxel in that order.
+            if "pos" in f and not torch.equal(self._coord_to_voxel(torch.from_numpy(f["pos"][:])).cpu(),
+                                              torch.arange(self._n_voxels)):
+                raise ValueError("%s: rows are not one per grid voxel in lookup order" % filepath)
 
             if not lazy:
                 self.vis = torch.from_numpy(f["vis"][:]).float().to(self._device)
