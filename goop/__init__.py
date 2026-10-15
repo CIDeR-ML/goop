@@ -31,10 +31,12 @@ from .kernels import (
 )
 from .noise import DarkNoise
 from .sampler import (
+    ChromaTOFSampler,
     DifferentiableTOFSampler,
     PCATOFSampler,
     SirenTOFSampler,
     TOFSampler,
+    create_chroma_tof_sampler,
     create_default_tof_sampler,
     create_siren_tof_sampler,
 )
@@ -74,6 +76,8 @@ __all__ = [
     "PCATOFSampler",
     "TOFSampler",
     "SirenTOFSampler",
+    "ChromaTOFSampler",
+    "create_chroma_tof_sampler",
     "create_default_tof_sampler",
     "create_siren_tof_sampler",
     "OpticalSimulator",
