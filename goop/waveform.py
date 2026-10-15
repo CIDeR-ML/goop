@@ -263,81 +263,64 @@ class SlicedWaveform:
         """
         snap = t0_snap_ns or tick_ns
         device = times.device
-        all_adc: List[torch.Tensor] = []
-        offsets_list = [0]
-        all_t0: List[float] = []
-        all_pmt: List[int] = []
 
-        # Default t0 for channels with no photons. Using 0.0 here pins
-        # `deslice()`'s window to absolute-time zero whenever *any* channel is
-        # inactive, which blows n_bins up by `min(real photon t)/tick` — e.g.
-        # an interaction at t ≈ 486 μs with half the PMTs on the opposite wall
-        # turns a ~3 μs physical span into a ~488 μs dense array. Snap the
-        # earliest real photon time instead so inactive channels land at the
-        # start of the real activity window.
-        if times.numel() > 0:
-            default_t0 = float((times.min() / snap).floor() * snap)
-        else:
-            default_t0 = 0.0
+        # Each channel's photons as one run, in their input order (channels
+        # outside [0, n_channels) are ignored); each run is sorted below.
+        keep = (channels >= 0) & (channels < n_channels)
+        ch, by_ch = channels[keep].sort(stable=True)
+        t = times[keep][by_ch]
+        w = weights[keep][by_ch] if weights is not None else torch.ones_like(t, dtype=torch.float32)
+        counts = torch.bincount(ch, minlength=n_channels).tolist()
+        active = [c for c in range(n_channels) if counts[c] > 0]
+        if not active:
+            return SlicedWaveform(
+                adc=torch.zeros(0, device=device),
+                offsets=torch.zeros(1, device=device, dtype=torch.long),
+                t0_ns=torch.zeros(0, device=device, dtype=torch.float32),
+                pmt_id=torch.zeros(0, device=device, dtype=torch.long),
+                tick_ns=tick_ns,
+                n_channels=n_channels,
+            )
+        ends = torch.tensor(counts, device=device).cumsum(0)
+        firsts = (ends - torch.tensor(counts, device=device))[active]
+        lasts = ends[active] - 1
 
-        for ch in range(n_channels):
-            ch_mask = channels == ch
-            ch_times = times[ch_mask]
+        # Per channel: sort by time and cut out dead time beyond the kernel
+        # extent. Each channel gets its own sort and cumsum, as before, so ties
+        # and the running sum come out the same.
+        cum_dead = torch.zeros_like(t)
+        for a, b in zip(firsts.tolist(), (lasts + 1).tolist()):
+            t[a:b], o = t[a:b].sort()
+            w[a:b] = w[a:b][o]
+            cum_dead[a + 1:b] = (torch.diff(t[a:b]) - kernel_extent_ns).clamp(min=0).cumsum(0)
+        diffs = torch.diff(t)
+        ch_t0 = torch.zeros(n_channels, device=device, dtype=t.dtype)
+        ch_t0[active] = (t[firsts] / snap).floor() * snap
+        compressed_t = t - cum_dead - ch_t0[ch]
 
-            if ch_times.numel() == 0:
-                continue
+        # One histogram per channel, laid end to end.
+        n_bins = torch.zeros(n_channels, device=device, dtype=torch.long)
+        n_bins[active] = torch.tensor([int(v / tick_ns) + 1 for v in compressed_t[lasts].tolist()], device=device)
+        hist_start = n_bins.cumsum(0) - n_bins
+        bin_idx = torch.minimum((compressed_t / tick_ns).long(), n_bins[ch] - 1)
+        adc = torch.zeros(int(n_bins.sum()), device=device, dtype=torch.float32)
+        adc.scatter_add_(0, hist_start[ch] + bin_idx, w)
 
-            sort_idx = ch_times.sort().indices
-            sorted_t = ch_times[sort_idx]
-            ch_w = weights[ch_mask][sort_idx] if weights is not None else None
-            diffs = torch.diff(sorted_t)
-            ch_t0 = (sorted_t[0] / snap).floor() * snap
-
-            excess = (diffs - kernel_extent_ns).clamp(min=0)
-            cum_dead = torch.cat([torch.zeros(1, device=device), excess.cumsum(0)])
-            compressed_t = sorted_t - cum_dead - ch_t0
-
-            n_bins = int(compressed_t[-1].item() / tick_ns) + 1
-            bin_idx = (compressed_t / tick_ns).long().clamp(max=n_bins - 1)
-            hist = torch.zeros(n_bins, device=device, dtype=torch.float32)
-            w = ch_w if ch_w is not None else torch.ones_like(bin_idx, dtype=torch.float32)
-            hist.scatter_add_(0, bin_idx, w)
-
-            gap_mask = diffs > kernel_extent_ns
-            gap_indices = torch.where(gap_mask)[0]
-
-            if gap_indices.numel() > 0:
-                comp_bins = (compressed_t[gap_indices + 1] / tick_ns).long()
-                # Each post-gap chunk's t0 must equal the absolute time of
-                # its bin 0. That's `ch_t0 + comp_bin*tick_ns + cum_dead`,
-                # which is on the fine `tick_ns` grid (NOT `snap`):
-                # snapping post-gap chunk t0 to a coarser grid corrupts the
-                # alignment between bin index and absolute time, since the
-                # compressed bin is already at fine_tick resolution.
-                cum_dead_at_gap = cum_dead[gap_indices + 1]
-                real_times = (
-                    ch_t0 + comp_bins.to(compressed_t.dtype) * tick_ns + cum_dead_at_gap
-                )
-                chunk_bin_starts = [0] + comp_bins.tolist()
-                chunk_time_starts = [ch_t0.item()] + real_times.tolist()
-            else:
-                chunk_bin_starts = [0]
-                chunk_time_starts = [ch_t0.item()]
-
-            n_ch_chunks = len(chunk_bin_starts)
-            for k in range(n_ch_chunks):
-                c0 = chunk_bin_starts[k]
-                c1 = chunk_bin_starts[k + 1] if k + 1 < n_ch_chunks else hist.numel()
-                all_adc.append(hist[c0:c1])
-                offsets_list.append(offsets_list[-1] + (c1 - c0))
-                all_t0.append(chunk_time_starts[k])
-                all_pmt.append(ch)
-
+        # Chunks: each channel's bin 0, then one per gap longer than the kernel
+        # extent. A post-gap chunk's t0 is the absolute time of its bin 0, on
+        # the fine `tick_ns` grid (NOT `snap`): snapping it to a coarser grid
+        # would break the alignment between bin index and absolute time.
+        gap = torch.nonzero((diffs > kernel_extent_ns) & (ch[1:] == ch[:-1])).squeeze(1) + 1
+        comp_bins = (compressed_t[gap] / tick_ns).long()
+        real_times = ch_t0[ch[gap]] + comp_bins.to(compressed_t.dtype) * tick_ns + cum_dead[gap]
+        active_t = torch.tensor(active, device=device)
+        starts = torch.cat([hist_start[active_t], hist_start[ch[gap]] + comp_bins])
+        chunk_order = starts.sort(stable=True).indices
         return SlicedWaveform(
-            adc=torch.cat(all_adc) if all_adc else torch.zeros(0, device=device),
-            offsets=torch.tensor(offsets_list, device=device, dtype=torch.long),
-            t0_ns=torch.tensor(all_t0, device=device, dtype=torch.float32),
-            pmt_id=torch.tensor(all_pmt, device=device, dtype=torch.long),
+            adc=adc,
+            offsets=torch.cat([starts[chunk_order], adc.new_tensor([adc.numel()], dtype=torch.long)]),
+            t0_ns=torch.cat([ch_t0[active_t], real_times])[chunk_order].to(torch.float32),
+            pmt_id=torch.cat([active_t, ch[gap]])[chunk_order].long(),
             tick_ns=tick_ns,
             n_channels=n_channels,
         )
