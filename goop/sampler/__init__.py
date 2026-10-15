@@ -3,6 +3,9 @@
 Class hierarchy:
 
     TOFSamplerBase (ABC)                          — goop/base.py
+     ├── ChromaTOFSampler                        — propagates every photon
+     │                                             through a chroma-lar detector
+     │                                             with TriChroma (not differentiable)
      └── PCATOFSampler (ABC)                      — shared PCA reconstruction +
           │                                         Poisson/inverse-CDF sampling +
           │                                         differentiable ``sample_pdf``
@@ -19,6 +22,7 @@ All public names are re-exported here so ``from goop.sampler import X`` and
 defines ``X``.
 """
 
+from .chroma_sampler import ChromaTOFSampler, create_chroma_tof_sampler
 from .base import (
     DEFAULT_N_SIMULATED,
     DEFAULT_PLIB_PATH,
@@ -38,6 +42,8 @@ from .siren import (
 )
 
 __all__ = [
+    "ChromaTOFSampler",
+    "create_chroma_tof_sampler",
     "PCATOFSampler",
     "TOFSampler",
     "DifferentiableTOFSampler",
