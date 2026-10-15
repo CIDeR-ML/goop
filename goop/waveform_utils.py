@@ -10,6 +10,20 @@ def _next_fft_size(n: int) -> int:
     return 1 << math.ceil(math.log2(max(n, 1)))
 
 
+def _gather_rows(data: torch.Tensor, starts: List[int], lengths: List[int], width: int) -> torch.Tensor:
+    """``(len(starts), width)`` rows: row i is ``data[starts[i]:starts[i] + lengths[i]]``, zero-padded."""
+    out = torch.zeros(len(starts), width, device=data.device, dtype=data.dtype)
+    total = sum(lengths)
+    if total:
+        lens = torch.tensor(lengths, device=data.device)
+        row = torch.repeat_interleave(torch.arange(len(starts), device=data.device), lens, output_size=total)
+        begin = torch.cumsum(lens, 0) - lens
+        col = torch.arange(total, device=data.device) - torch.repeat_interleave(begin, lens, output_size=total)
+        first = torch.repeat_interleave(torch.tensor(starts, device=data.device), lens, output_size=total)
+        out[row, col] = data[first + col]
+    return out
+
+
 def _slice_channel(
     data: torch.Tensor,
     t0: float,
