@@ -75,13 +75,17 @@ def test_convolve_in_small_batches_matches(device, monkeypatch):
     sw = _sliced(device, LENGTHS, PMTS, T0S, n_channels=5)
     kernel = torch.exp(-torch.arange(600, device=device) / 80.0)
     whole = sw.convolve(kernel, gain=2.0)
-    monkeypatch.setattr(waveform, "_FFT_BATCH_ELEMENTS", 1)  # one chunk per FFT batch
+    monkeypatch.setattr(waveform, "_BATCH_ELEMENTS", 1)  # one chunk per FFT batch
     assert torch.equal(sw.convolve(kernel, gain=2.0).adc, whole.adc)
 
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("factor", [1, 7, 10])
-def test_downsample_matches_per_chunk_reference(device, factor):
+@pytest.mark.parametrize("batch", [None, 800])  # 800: several batches, some chunks alone
+def test_downsample_matches_per_chunk_reference(device, factor, batch, monkeypatch):
+    if batch is not None:
+        import goop.waveform as waveform
+        monkeypatch.setattr(waveform, "_BATCH_ELEMENTS", batch)
     sw = _sliced(device, LENGTHS, PMTS, T0S)
     out = sw.downsample(factor)
     if factor == 1:
