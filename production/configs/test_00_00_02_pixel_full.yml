@@ -46,7 +46,7 @@ optical:
 
 sampler:
   type: lut
-  plib_path: /sdf/data/neutrino/youngsam/compressed_pixel_plib_b01_quantile_log_n50.h5
+  plib_path: /sdf/data/neutrino/youngsam/compressed_pixel_plib_b01_quantile_log_n50_repaired.h5
   pmt_qe: 0.12
   n_simulated: 30000000
   lazy: false
