@@ -21,6 +21,28 @@ __all__ = [
 ]
 
 
+def _check_row_order(pos, numvox, min_xyz, max_xyz):
+    """Raise unless the library has one row per grid voxel, x fastest: the row a lookup reads.
+
+    ``pos`` is the stored voxel centre of each row. A table with missing voxels
+    or rows in another order would make every lookup after the first misplaced
+    row read another voxel's light.
+    """
+    numvox = np.asarray(numvox, dtype=np.int64)
+    lo = np.asarray(min_xyz, dtype=np.float64)
+    size = (np.asarray(max_xyz, dtype=np.float64) - lo) / numvox
+    n = int(np.prod(numvox))
+    if len(pos) != n:
+        raise ValueError("photon library has %d rows for a %s grid of %d voxels; lookups need one row per voxel"
+                         % (len(pos), numvox.tolist(), n))
+    r = np.arange(n)
+    ijk = np.stack([r % numvox[0], (r // numvox[0]) % numvox[1], r // (numvox[0] * numvox[1])], 1)
+    off = (np.abs(lo + (ijk + 0.5) * size - np.asarray(pos)) > 0.5 * size).any(1)
+    if off.any():
+        raise ValueError("photon library rows are not in grid order (x fastest): %d of %d rows are not at their "
+                         "voxel, the first is row %d" % (off.sum(), n, int(np.argmax(off))))
+
+
 def create_default_tof_sampler(**kwargs) -> TOFSamplerBase:
     """Create a TOFSampler with the standard photon library.
 
@@ -76,6 +98,8 @@ class TOFSampler(PCATOFSampler):
                 max_xyz=basis["max_xyz"],
             )
             self._n_voxels = basis["n_voxels"]
+            if "pos" in f:
+                _check_row_order(f["pos"][:], basis["numvox"], basis["min_xyz"], basis["max_xyz"])
 
             if not lazy:
                 self.vis = torch.from_numpy(f["vis"][:]).float().to(self._device)
