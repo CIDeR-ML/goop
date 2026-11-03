@@ -156,7 +156,7 @@ siren = create_siren_tof_sampler(device="cuda:0")
 config = OpticalSimConfig(tof_sampler=siren, ...)
 ```
 
-`ChromaTOFSampler` takes a different route: it simulates each step's photons in chroma-lar's detector with Chroma's Triton backend (TriChroma), so it uses the exact detector physics and no photon library. It needs [chroma-lar](https://github.com/youngsm/chroma-lar) installed and a CUDA GPU, and it is not differentiable. On an A100 the edepsim test event takes 0.30 s to sample and 1.0 s through the full pipeline (0.79 s with the LUT).
+`ChromaTOFSampler` takes a different route: it simulates each step's photons in chroma-lar's detector with Chroma's Triton backend (TriChroma), so it uses the exact detector physics and no photon library. It needs [chroma-lar](https://github.com/youngsm/chroma-lar), which `environment.yml` installs together with the TriChroma it pins, and a CUDA GPU. It is not differentiable. On an A100 the edepsim test event takes 0.30 s to sample and 1.0 s through the full pipeline (0.79 s with the LUT).
 
 ```python
 from goop import create_chroma_tof_sampler
