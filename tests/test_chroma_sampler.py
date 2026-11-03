@@ -32,8 +32,10 @@ def test_hits_map_back_to_their_steps(sampler):
 
 
 def test_call_depends_only_on_torch_seed(sampler):
-    pos = torch.tensor([[-1000.0, 0.0, 0.0]], device="cuda")
-    n_photons = torch.tensor([1e5], device="cuda")
+    # event-sized: ~1e7 photons from many steps, spread over many GPU blocks and batches
+    gen = torch.Generator().manual_seed(0)
+    pos = ((torch.rand(200, 3, generator=gen) - 0.5) * 3000).cuda()
+    n_photons = torch.full((200,), 4e5, device="cuda")
     torch.manual_seed(7)
     first = sampler.sample(pos, n_photons, None)
     sampler.sample(pos, n_photons, None)  # an unrelated call in between must not shift the next one

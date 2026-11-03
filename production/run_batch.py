@@ -27,20 +27,15 @@ import time
 # and jaxtpc/ so its internal `from tools.X` imports resolve
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _project_root)
-sys.path.insert(0, os.path.join(_project_root, 'jaxtpc'))
+# GOOP_JAXTPC_DIR selects another jaxtpc checkout, e.g. the one a step-file campaign was made with
+sys.path.insert(0, os.environ.get('GOOP_JAXTPC_DIR', os.path.join(_project_root, 'jaxtpc')))
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import h5py
-import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 from torch.distributions import Poisson, Uniform, HalfNormal
-
-from tools.geometry import generate_detector
-from tools.simulation import DetectorSimulator
-from tools.loader import load_event
 
 from goop import OpticalSimulator
 from goop.config import (
@@ -65,9 +60,44 @@ sys.stdout.reconfigure(line_buffering=True)
 # HELPERS
 # =============================================================================
 
+def is_step_file(data_path):
+    """True for a jaxtpc step file (entry_NNNNNN groups), False for edep-sim (pstep/)."""
+    with h5py.File(data_path, 'r') as f:
+        return 'pstep' not in f and 'entry_000000' in f
+
+
 def get_num_events(data_path):
     with h5py.File(data_path, 'r') as f:
-        return f['pstep/lar_vol'].shape[0]
+        if 'pstep' in f:
+            return f['pstep/lar_vol'].shape[0]
+        return sum(1 for k in f if k.startswith('entry_'))
+
+
+def load_step_event(data_path, event_idx):
+    """Read GOOP inputs for one event of a jaxtpc step file (no jaxtpc needed).
+
+    Positions are stored as uint16 * pos_step_mm + per-volume origin, already in
+    global mm. Returns numpy (pos_mm, n_photons, t_step_ns, labels, pdgs=None,
+    de, total_segs) with the volume index as label.
+    """
+    import hdf5plugin  # noqa: F401  registers the blosc filter jaxtpc production writes with
+    pos, nph, tns, lbl, des = [], [], [], [], []
+    with h5py.File(data_path, 'r') as f:
+        evt = f[f'entry_{event_idx:06d}']
+        for v in range(int(evt.attrs.get('n_volumes', 2))):
+            vg = evt.get(f'volume_{v}')
+            if vg is None or int(vg.attrs['n_actual']) == 0:
+                continue
+            origin = np.array([vg.attrs[f'pos_origin_{a}'] for a in 'xyz'], dtype=np.float32)
+            pos.append(vg['positions'][:].astype(np.float32) * np.float32(vg.attrs['pos_step_mm']) + origin)
+            nph.append(np.ceil(vg['photons'][:]).astype(np.int32))
+            tns.append(vg['t0_us'][:].astype(np.float32) * 1000.0)  # us -> ns
+            lbl.append(np.full(len(pos[-1]), v, dtype=np.int32))
+            des.append(vg['de'][:].astype(np.float32))
+    if not pos:
+        raise ValueError(f'{data_path}: entry_{event_idx:06d} has no deposits')
+    pos, nph, tns, lbl, des = (np.concatenate(x) for x in (pos, nph, tns, lbl, des))
+    return pos, nph, tns, lbl, None, des, len(pos)
 
 def output_file_complete(path, expected_events, expected_event_offset=None,
                          expected_source_file=None):
@@ -131,6 +161,7 @@ def extract_goop_inputs(filled, cfg, label_key='interaction'):
     Returns (pos_mm, n_photons, t_step_ns, labels) as JAX arrays,
     plus total_segs count.
     """
+    import jax.numpy as jnp
     field = LABEL_FIELDS[label_key]
     all_pos, all_nph, all_t, all_labels = [], [], [], []
     all_pdgs, all_des = [], []
@@ -366,6 +397,13 @@ def build_parser(defaults=None):
     parser.add_argument('--no-align', dest='align',
                         action='store_false',
                         help='Disable waveform alignment, overriding a YAML align setting')
+    parser.add_argument('--deterministic', dest='deterministic',
+                        action='store_true', default=defaults['deterministic'],
+                        help='Deterministic GPU kernels (torch, cuBLAS, XLA): same input + seed + '
+                             'GPU model + software gives bitwise-identical output; slower')
+    parser.add_argument('--no-deterministic', dest='deterministic',
+                        action='store_false',
+                        help='Disable deterministic mode, overriding a YAML deterministic setting')
     return parser
 
 
@@ -437,6 +475,8 @@ def _collect_cli_overrides(args, argv):
 
     if _option_present(argv, ['--align', '--no-align']):
         overrides['align'] = args.align
+    if _option_present(argv, ['--deterministic', '--no-deterministic']):
+        overrides['deterministic'] = args.deterministic
     if _option_present(argv, ['--overwrite', '--no-overwrite']):
         overrides['overwrite'] = args.overwrite
     if _option_present(argv, ['--skip-existing', '--resume', '--no-skip-existing']):
@@ -490,6 +530,13 @@ def main(argv=None):
     time_window_ns = args.time_window_ns
     use_time_window = time_window_enabled(time_window_ns)
 
+    if args.deterministic:
+        # must precede the first cuBLAS call and the (lazy) jax import
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        os.environ['XLA_FLAGS'] = (os.environ.get('XLA_FLAGS', '') + ' --xla_gpu_deterministic_ops=true').strip()
+        # warn_only: an op with no deterministic kernel warns in the log instead of stopping production
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
     if start_event < 0:
         raise ValueError(f'--start-event must be >= 0, got {start_event}')
     if events_per_file <= 0:
@@ -499,6 +546,10 @@ def main(argv=None):
     if args.overwrite and args.skip_existing:
         raise ValueError('--overwrite and --skip-existing are mutually exclusive')
 
+    step_input = is_step_file(args.data)
+    if step_input and label_key != 'volume':
+        raise ValueError('jaxtpc step files carry no interaction/track ids; '
+                         'use --label-key volume')
     total_events = get_num_events(args.data)
     if start_event > total_events:
         raise ValueError(
@@ -569,25 +620,56 @@ def main(argv=None):
           + ('  (disabled)' if args.voxel_dx <= 0 else ''))
     print(f'  Total pad:      {args.total_pad:,}')
     print(f'  Workers:        {args.workers} {"(serial)" if args.workers == 0 else "(threaded)"}')
-    print(f'  JAX device:     {jax.devices()[0]}')
+    print(f'  Input format:   {"jaxtpc step (no jaxtpc light sim)" if step_input else "edep-sim"}')
+    print(f'  Deterministic:  {"ON" if args.deterministic else "off"}')
     print(f'  CUDA device:    {torch.cuda.get_device_name(0)}')
     print(f'  Output:         {optical_dir}/')
     print(f'  Label dist:     {label_dist}')
     print(f'  Time window:    {f"{time_window_ns} ns" if use_time_window else "disabled"}')
     print()
 
-    # ---- Create jaxtpc simulator (light-only) ----
-    t_create = time.time()
-    detector_config = generate_detector(args.config)
-    jaxtpc_sim = DetectorSimulator(
-        detector_config,
-        total_pad=args.total_pad,
-        response_chunk_size=args.response_chunk_size,
-        include_track_hits=False,
-    )
-    cfg = jaxtpc_sim.config
-    t_create = time.time() - t_create
-    print(f'  jaxtpc creation:  {t_create:.1f}s')
+    if step_input:
+        with h5py.File(args.data, 'r') as f:
+            n_volumes = int(f['entry_000000'].attrs.get('n_volumes', 2))
+
+        def prefetch_load(evt_idx):
+            """Load event from HDF5 (CPU-only, no GPU work)."""
+            return load_step_event(args.data, evt_idx)
+
+        def light_inputs(loaded):
+            """Step files already hold photons: just move the arrays to the GPU."""
+            return tuple(None if x is None else torch.as_tensor(x, device='cuda')
+                         for x in loaded[:-1]) + (loaded[-1],)
+    else:
+        import jax
+        from tools.geometry import generate_detector
+        from tools.simulation import DetectorSimulator
+        from tools.loader import load_event
+        print(f'  JAX device:     {jax.devices()[0]}')
+
+        # ---- Create jaxtpc simulator (light-only) ----
+        t_create = time.time()
+        detector_config = generate_detector(args.config)
+        jaxtpc_sim = DetectorSimulator(
+            detector_config,
+            total_pad=args.total_pad,
+            response_chunk_size=args.response_chunk_size,
+            include_track_hits=False,
+        )
+        cfg = jaxtpc_sim.config
+        n_volumes = cfg.n_volumes
+        t_create = time.time() - t_create
+        print(f'  jaxtpc creation:  {t_create:.1f}s')
+
+        def prefetch_load(evt_idx):
+            """Load event from HDF5 (CPU-only, no GPU work)."""
+            return load_event(args.data, cfg, event_idx=evt_idx)
+
+        def light_inputs(deposits):
+            """jaxtpc light generation (GPU, main thread) -> GOOP inputs."""
+            filled = jaxtpc_sim.process_event_light(deposits)
+            jax.block_until_ready(filled.volumes[0].charge)
+            return extract_goop_inputs(filled, cfg, label_key)
 
     # ---- Create GOOP simulator ----
     t_goop = time.time()
@@ -601,10 +683,7 @@ def main(argv=None):
     t_warmup = time.time()
     warmup_idx = min(start_event, total_events - 1)
     seed_for_event(args.seed, warmup_idx)
-    warmup_dep = load_event(args.data, cfg, event_idx=warmup_idx)
-    warmup_filled = jaxtpc_sim.process_event_light(warmup_dep)
-    jax.block_until_ready(warmup_filled.volumes[0].charge)
-    pos, nph, tns, lbl, pdg, des, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
+    pos, nph, tns, lbl, pdg, des, _ = light_inputs(prefetch_load(warmup_idx))
     if use_time_window:
         rand_time_tpcs_ns = throw_in_time_window(pos, nph, tns, lbl, time_window_ns=args.time_window_ns, pdgs=pdg, de=des)
         pos = rand_time_tpcs_ns["pos_mm"]
@@ -618,12 +697,12 @@ def main(argv=None):
         warmup_wfs = goop_sim.simulate(
             pos_vox, nph_vox, tns_vox, labels=lbl_vox, stitched=True, subtract_t0=not use_time_window
         )
-        del warmup_dep, warmup_filled, warmup_wfs, pos, pos_vox, nph, nph_vox, tns, tns_vox, lbl, lbl_vox, pdg, des
+        del warmup_wfs, pos, pos_vox, nph, nph_vox, tns, tns_vox, lbl, lbl_vox, pdg, des
     else:
         warmup_wfs = goop_sim.simulate(
             pos, nph, tns, labels=lbl, stitched=True, subtract_t0=not use_time_window
         )        
-        del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl, pdg, des
+        del warmup_wfs, pos, nph, tns, lbl, pdg, des
     gc.collect()
     torch.cuda.empty_cache()
     t_warmup = time.time() - t_warmup
@@ -722,7 +801,7 @@ def main(argv=None):
                 write_config_light(
                     f, goop_config,
                     label_key=label_key,
-                    n_labels=cfg.n_volumes if label_key == 'volume' else 0,
+                    n_labels=n_volumes if label_key == 'volume' else 0,
                     dataset_name=dataset_name,
                     file_index=output_file_idx,
                     source_file=args.data,
@@ -745,10 +824,6 @@ def main(argv=None):
                                              args=(f, save_queue), daemon=True)
                         t.start()
                         workers.append(t)
-
-                def prefetch_load(evt_idx):
-                    """Load event from HDF5 (CPU-only, no GPU work)."""
-                    return load_event(args.data, cfg, event_idx=evt_idx)
 
                 print(f"  {'Evt':>4} {'Segs':>16} {'Photons':>12} "
                       f"{'Labels':>6} {'PEs':>10} {'Chunks':>7} "
@@ -781,17 +856,12 @@ def main(argv=None):
                         if evt_idx + 1 < event_end:
                             future = prefetch.submit(prefetch_load, evt_idx + 1)
 
-                        # 3. jaxtpc light generation (GPU — kept in main thread)
+                        # 3. Light generation (jaxtpc on GPU, or step-file passthrough)
                         t0 = time.time()
-                        filled = jaxtpc_sim.process_event_light(deposits)
-                        jax.block_until_ready(filled.volumes[0].charge)
+                        pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = light_inputs(deposits)
                         t_light = time.time() - t0
 
-                        # 4. Extract inputs & run GOOP
-                        t0 = time.time()
-
-                        pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = extract_goop_inputs(
-                            filled, cfg, label_key)
+                        # 4. Run GOOP
 
                         n_after = total_segs
                         if use_time_window:
@@ -869,7 +939,7 @@ def main(argv=None):
                               f"{t_goop_elapsed:>5.2f}s {t_save:>5.2f}s "
                               f"{t_total:>5.1f}s")
 
-                        del deposits, filled, waveforms, waveforms_cpu
+                        del deposits, waveforms, waveforms_cpu
                         del pos_mm, n_ph, t_ns, labels, pdgs, des
                         del sim_pos, sim_nph, sim_tns, sim_labels
                         del raw_pos, raw_nph, raw_tns, raw_lbl, raw_pdg, raw_des
