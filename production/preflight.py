@@ -177,7 +177,17 @@ def main(argv: list[str] | None = None) -> int:
     asset_required = not args.skip_assets
     _check_path("run.data", run.get("data"), failures, required=asset_required)
     _check_path("detector.config", detector.get("config"), failures, required=True)
-    _check_path("sampler.plib_path", sampler.get("plib_path"), failures, required=asset_required)
+    if sampler.get("type") == "chroma":
+        try:
+            from goop.sampler.chroma_sampler import require_trichroma
+
+            require_trichroma()
+            print("[ OK ] chroma-lar with a usable TriChroma")
+        except Exception as exc:
+            failures.append(f"chroma sampler: {exc}")
+            print(f"[FAIL] chroma sampler: {exc}")
+    else:
+        _check_path("sampler.plib_path", sampler.get("plib_path"), failures, required=asset_required)
     if sampler.get("type") == "siren":
         _check_path("sampler.ckpt_path", sampler.get("ckpt_path"), failures, required=asset_required)
         _check_path("sampler.cfg_path", sampler.get("cfg_path"), failures, required=asset_required)

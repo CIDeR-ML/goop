@@ -122,6 +122,29 @@ def test_run_config_yaml_defaults(tmp_path):
     assert args.voxel_dx == 10.0
 
 
+def test_sampler_chroma_replaces_yaml_lut(tmp_path):
+    """``--sampler chroma`` drops the YAML's photon-library keys and takes the seeded chroma defaults."""
+    spec = importlib.util.spec_from_file_location("run_batch_smoke_mod", str(RUN_BATCH))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    run_config = tmp_path / "run.yml"
+    run_config.write_text("sampler:\n  type: lut\n  plib_path: /tmp/plib.h5\n  lazy: true\n", encoding="utf-8")
+
+    args = module.parse_args(["--run-config", str(run_config), "--sampler", "chroma", "--pmt-qe", "0.2"])
+    assert args.resolved_config["sampler"] == {
+        "type": "chroma",
+        "detector_config": "detector_config_reflect_reflect3wires",
+        "wavelength": 450.0,
+        "pmt_qe": 0.2,
+        "seed": 0,
+        "photons_per_batch": 50_000_000,
+        "max_steps": 1000,
+        "device": "cuda:0",
+    }
+
+
 @pytest.mark.skipif(
     shutil.which("python") is None,
     reason="No python available for subprocess smoke",

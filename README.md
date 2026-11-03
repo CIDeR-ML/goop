@@ -164,6 +164,8 @@ from goop import create_chroma_tof_sampler
 chroma = create_chroma_tof_sampler(seed=0)  # chroma-lar wire TPC, 450 nm, PMT efficiency 0.12
 ```
 
+In production runs, select it with `--sampler chroma` or `sampler: {type: chroma}` (see `production/README.md`).
+
 ### Input voxelization
 
 The diff-sim cost scales linearly with the number of input segments N. `voxelize` bins nearby segments into cubic voxels, summing photon counts and photon-weighting positions/times. Total photon yield is exactly preserved.

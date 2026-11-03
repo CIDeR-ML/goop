@@ -16,6 +16,20 @@ import torch
 from ..base import TOFSamplerBase
 
 
+def require_trichroma():
+    """Raise unless chroma-lar and a TriChroma this sampler can use are installed."""
+    from chroma.backend import backend_name
+
+    if backend_name() != "triton":
+        raise RuntimeError("ChromaTOFSampler needs Chroma's Triton backend; unset CHROMA_BACKEND")
+    import chroma_lar.geometry  # noqa: F401
+    from chroma.event import Photons
+
+    if not hasattr(Photons(), "index"):
+        raise RuntimeError("ChromaTOFSampler needs a TriChroma whose hits carry the input photon index "
+                           "(youngsm/trichroma#3)")
+
+
 class ChromaTOFSampler(TOFSamplerBase):
     """Sample detected photons by simulating them in a chroma-lar detector.
 
@@ -25,27 +39,26 @@ class ChromaTOFSampler(TOFSamplerBase):
     photons statistically unchanged and simulates fewer photons. Channel ids
     are the detector's; for chroma-lar's TPC they match the photon library's
     2P layout.
+
+    TriChroma keys each photon's random draws on (seed, photon id), and its ids
+    run on across calls. Every ``sample`` call therefore starts its ids at an
+    offset drawn from Torch's RNG, so a call is reproducible from the Torch
+    seed alone, like the rest of goop.
     """
 
     def __init__(self, detector_config: str = "detector_config_reflect_reflect3wires",
                  wavelength: float = 450.0, pmt_qe: float = 0.12, seed: int | None = None,
                  photons_per_batch: int = 50_000_000, max_steps: int = 1000, device: str = "cuda:0"):
-        from chroma.backend import backend_name
-
-        if backend_name() != "triton":
-            raise RuntimeError("ChromaTOFSampler needs Chroma's Triton backend; unset CHROMA_BACKEND")
-        from chroma.event import Photons
+        require_trichroma()
         from chroma.sim import Simulation
         from chroma_lar.geometry import build_detector_from_config
-
-        if not hasattr(Photons(), "index"):
-            raise RuntimeError("ChromaTOFSampler needs a TriChroma whose hits carry the input photon index "
-                               "(youngsm/trichroma#3)")
 
         self._device = torch.device(device)
         detector = build_detector_from_config(detector_config, flatten=True)
         self._n_channels = int(detector.num_channels())
         self._sim = Simulation(detector, seed=seed, cuda_device=self._device.index)
+        if not hasattr(self._sim, "_next_photon_id"):
+            raise RuntimeError("ChromaTOFSampler needs TriChroma's Simulation._next_photon_id photon counter")
         self._wavelength = float(wavelength)
         self._pmt_qe = float(pmt_qe)
         self._photons_per_batch = int(photons_per_batch)
@@ -71,6 +84,9 @@ class ChromaTOFSampler(TOFSamplerBase):
             empty = torch.empty(0, device=dev)
             return empty, empty.long(), empty.long()
 
+        # shortcut: sets TriChroma's private photon-id counter; use a public API if TriChroma adds one.
+        # 2**62 leaves room for any call's photons within the 64-bit ids.
+        self._sim._next_photon_id = int(torch.randint(0, 2**62, (1,), device=dev))
         photons = self._photons(pos[source], t_step[source])
         times, channels, rows = [], [], []
         # one event per chunk of at most photons_per_batch photons
