@@ -13,7 +13,9 @@ dependencies:
   - matplotlib
   - tqdm
   - pytest
-  - pytorch
+  - pytorch=2.5.1  # the version chroma-lar pins
   - pytorch-cuda=12.1
   - pip:
       - "jax[cuda12]"
+      # the chroma sampler: chroma-lar's detectors and the TriChroma it pins (youngsm/trichroma@fcae69c)
+      - "chroma-lar @ git+https://github.com/youngsm/chroma-lar.git@177b89d"

@@ -276,7 +276,7 @@ The `--label-key` flag controls how deposits are grouped into separate waveforms
 
 `--sampler siren` uses a pre-trained `PcaSiren` network that predicts the same `(visibility, t0, PCA coefficients)` tuple as the LUT, but on demand via a network forward — no resident voxel grid. Memory footprint drops from ~26 GB to ~500 MB; per-call cost is higher because every unique segment position pays a network forward. **Voxelization (`--voxel-dx`) helps SIREN much more than LUT** because it dramatically reduces the number of unique positions hitting the network (see Performance below).
 
-`--sampler chroma` uses no photon library. Instead, TriChroma (Chroma's Triton backend) propagates every photon, after the PMT efficiency is applied, through a chroma-lar detector. It needs [chroma-lar](https://github.com/youngsm/chroma-lar) with a TriChroma that includes youngsm/trichroma#3, and `CHROMA_BACKEND` unset or set to `triton`. `production/preflight.py` checks both when the run config selects the chroma sampler. Its options go in the run config's `sampler:` section; anything left out takes the default shown here:
+`--sampler chroma` uses no photon library. Instead, TriChroma (Chroma's Triton backend) propagates every photon, after the PMT efficiency is applied, through a chroma-lar detector. `environment.yml` installs [chroma-lar](https://github.com/youngsm/chroma-lar) and the TriChroma it pins. `CHROMA_BACKEND` must be unset or set to `triton`. When the run config selects the chroma sampler, `production/preflight.py` checks both the install and the backend. Its options go in the run config's `sampler:` section; anything left out takes the default shown here:
 
 ```yaml
 sampler:
