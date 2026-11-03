@@ -66,7 +66,7 @@ python3 production/run_batch.py \
 | `--oversample`                                       | 10                                                                    | Internal oversampling factor                                                                                                        |
 | `--total-pad`                                        | 250,000                                                               | Max deposits per side (jaxtpc JIT shape)                                                                                            |
 | `--response-chunk-size`                              | 50,000                                                                | jaxtpc response chunk size                                                                                                          |
-| `--sampler`                                          | `lut`                                                                 | TOF sampler backend: `lut` (eager voxel LUT) or `siren` (SIREN neural net)                                                          |
+| `--sampler`                                          | `lut`                                                                 | TOF sampler backend: `lut` (eager voxel LUT), `siren` (SIREN neural net) or `chroma` (every photon propagated by TriChroma)         |
 | `--pca-lut-path`, `--plib-path`                      | `/sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5` | PCA photon-library HDF5 used by the LUT sampler, and as the PCA basis for SIREN                                                     |
 | `--pmt-qe`                                           | 0.12                                                                  | PMT quantum efficiency passed to the TOF sampler                                                                                    |
 | `--lut-n-simulated`                                  | 15,000,000                                                            | Number of simulated photons represented by the PCA LUT                                                                              |
@@ -249,7 +249,7 @@ For each event, `run_batch.py` performs:
 3. **Extract** GOOP inputs: `positions_mm`, `ceil(photons).int32`, `t0_us * 1000` (-> ns), per-deposit labels (interaction ID by default; configurable via `--label-key`)
 4. **Voxelize** *(optional, when `--voxel-dx > 0`)* — bin segments per-label-group into a cubic grid of side length `dx` mm via `voxelize_labeled`. Photon counts are summed within each voxel; positions and times are photon-weighted means. 4. **Voxelize** *(optional, when `--voxel-dx > 0`)* — bin segments per-label-group into a cubic grid of side length `dx` mm via `voxelize_labeled`. Photon counts are summed within each voxel; positions and times are photon-weighted means. Empirically a `dx` of 10 mm results in 20x less point simulated but indistinguishable waveforms.
 5. **Optical simulation** via GOOP `OpticalSimulator.simulate` — produces one `SlicedWaveform` per unique label value:
-  - TOF sampling: either eager voxel LUT (default, `--sampler lut`) or SIREN neural net (`--sampler siren`); both use the same PCA basis (50 components, quantile-log) and inverse-CDF photon-time draw
+  - TOF sampling: eager voxel LUT (default, `--sampler lut`) or SIREN neural net (`--sampler siren`), which use the same PCA basis (50 components, quantile-log) and inverse-CDF photon-time draw; or TriChroma ray tracing (`--sampler chroma`)
   - Stochastic delays: scintillation (bi-exponential), TPB re-emission (tri-exponential), PMT TTS (Gaussian)
   - Optional dark noise injection
   - Histogramming into per-PMT time bins
@@ -275,6 +275,22 @@ The `--label-key` flag controls how deposits are grouped into separate waveforms
 `--sampler lut` (default) loads the full PCA-compressed photon library into GPU memory at startup (~26 GB). Each sample lookup is a fast trilinear interpolation on the resident grid.
 
 `--sampler siren` uses a pre-trained `PcaSiren` network that predicts the same `(visibility, t0, PCA coefficients)` tuple as the LUT, but on demand via a network forward — no resident voxel grid. Memory footprint drops from ~26 GB to ~500 MB; per-call cost is higher because every unique segment position pays a network forward. **Voxelization (`--voxel-dx`) helps SIREN much more than LUT** because it dramatically reduces the number of unique positions hitting the network (see Performance below).
+
+`--sampler chroma` uses no photon library. Instead, TriChroma (Chroma's Triton backend) propagates every photon, after the PMT efficiency is applied, through a chroma-lar detector. It needs [chroma-lar](https://github.com/youngsm/chroma-lar) with a TriChroma that includes youngsm/trichroma#3, and `CHROMA_BACKEND` unset or set to `triton`. `production/preflight.py` checks both when the run config selects the chroma sampler. Its options go in the run config's `sampler:` section; anything left out takes the default shown here:
+
+```yaml
+sampler:
+  type: chroma
+  detector_config: detector_config_reflect_reflect3wires  # detector_config_pixel for the pixel TPC
+  wavelength: 450.0
+  pmt_qe: 0.12
+  seed: 0
+  photons_per_batch: 50000000
+  max_steps: 1000
+  device: cuda:0
+```
+
+Keep `detector_config` matched to `detector.config`, because nothing checks that they agree. Chroma's cost scales with the number of photons rather than segments, so `--voxel-dx` saves little. Each event's TriChroma draws follow that event's seed (`--seed` plus the event index), so an event's output does not depend on which events ran before it.
 
 ### Voxelization
 

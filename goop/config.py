@@ -22,6 +22,7 @@ from .noise import DarkNoise
 from .sampler import (
     DEFAULT_N_SIMULATED,
     DEFAULT_PLIB_PATH,
+    create_chroma_tof_sampler,
     create_default_tof_sampler,
     create_siren_tof_sampler,
 )
@@ -42,6 +43,7 @@ AUX_SOURCE_REGISTRY = {
 SAMPLER_REGISTRY = {
     "lut": create_default_tof_sampler,
     "siren": create_siren_tof_sampler,
+    "chroma": create_chroma_tof_sampler,
 }
 
 DEFAULT_DELAY_CHAIN = [
@@ -119,6 +121,17 @@ DEFAULT_SAMPLER_CONFIGS = {
         "n_simulated": DEFAULT_N_SIMULATED,
         "device": "cuda:0",
         "pmt_qe": 0.12,
+    },
+    # Fixed seed: ChromaTOFSampler's own default (None) picks a random one per run.
+    "chroma": {
+        "type": "chroma",
+        "detector_config": "detector_config_reflect_reflect3wires",
+        "wavelength": 450.0,
+        "pmt_qe": 0.12,
+        "seed": 0,
+        "photons_per_batch": 50_000_000,
+        "max_steps": 1000,
+        "device": "cuda:0",
     },
 }
 

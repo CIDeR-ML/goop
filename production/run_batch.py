@@ -299,10 +299,11 @@ def build_parser(defaults=None):
                         default=defaults['response_chunk_size'],
                         help='jaxtpc response chunk size (default: 50000)')
     # Sampler
-    parser.add_argument('--sampler', choices=['lut', 'siren'],
+    parser.add_argument('--sampler', choices=['lut', 'siren', 'chroma'],
                         default=defaults['sampler'],
-                        help='TOF sampler backend: lut (voxel LUT, eager) or '
-                             'siren (SIREN neural network); default: lut')
+                        help='TOF sampler backend: lut (voxel LUT, eager), '
+                             'siren (SIREN neural network) or chroma (every '
+                             'photon propagated by TriChroma); default: lut')
     parser.add_argument('--pca-lut-path', '--plib-path',
                         default=defaults['pca_lut_path'],
                         help='PCA photon-library HDF5 path used by the LUT '

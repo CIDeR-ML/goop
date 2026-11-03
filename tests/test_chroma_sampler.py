@@ -35,6 +35,18 @@ def test_hits_map_back_to_their_steps(sampler):
     assert bool((on_positive_side == (source_idx == 1)).all())
 
 
+def test_call_depends_only_on_torch_seed(sampler):
+    pos = torch.tensor([[-1000.0, 0.0, 0.0]], device="cuda")
+    n_photons = torch.tensor([1e5], device="cuda")
+    torch.manual_seed(7)
+    first = sampler.sample(pos, n_photons, None)
+    sampler.sample(pos, n_photons, None)  # an unrelated call in between must not shift the next one
+    torch.manual_seed(7)
+    again = sampler.sample(pos, n_photons, None)
+    assert len(first[0]) > 0
+    assert all(torch.equal(a, b) for a, b in zip(first, again))
+
+
 def test_no_photons_gives_no_hits(sampler):
     times, channels, source_idx = sampler.sample(torch.zeros(2, 3, device="cuda"),
                                                  torch.zeros(2, device="cuda"), None)
