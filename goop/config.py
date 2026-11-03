@@ -67,6 +67,7 @@ DEFAULT_RUN_CONFIG = {
         "label_dist": "All",
         "seed": 42,
         "align": False,
+        "deterministic": False,
     },
     "detector": {
         "config": "jaxtpc/config/cubic_wireplane_config.yaml",
@@ -138,7 +139,7 @@ DEFAULT_SAMPLER_CONFIGS = {
 SECTION_KEYS = set(DEFAULT_RUN_CONFIG)
 
 SECTION_ALLOWED_KEYS = {
-    "run": {"data", "start_event", "events", "events_per_file", "label_key", "label_dist", "seed", "align"},
+    "run": {"data", "start_event", "events", "events_per_file", "label_key", "label_dist", "seed", "align", "deterministic"},
     "detector": {"config", "total_pad", "response_chunk_size"},
     "output": {"dataset", "outdir", "file_index_offset", "overwrite", "skip_existing", "workers"},
     "digitization": {"enabled", "n_bits", "pedestal", "max_pe_per_pmt"},
@@ -165,6 +166,7 @@ LEGACY_KEY_MAP = {
     "label_dist": ("run", "label_dist"),
     "seed": ("run", "seed"),
     "align": ("run", "align"),
+    "deterministic": ("run", "deterministic"),
     "config": ("detector", "config"),
     "detector_config": ("detector", "config"),
     "geometry_config": ("detector", "config"),
@@ -543,6 +545,7 @@ def flatten_config_for_argparse(config: Mapping[str, Any]) -> dict[str, Any]:
         "workers": output["workers"],
         "seed": run["seed"],
         "align": run["align"],
+        "deterministic": run["deterministic"],
     }
 
 

@@ -17,5 +17,6 @@ dependencies:
   - pytorch-cuda=12.1
   - pip:
       - "jax[cuda12]"
+      - hdf5plugin  # blosc filter used by jaxtpc step files
       # the chroma sampler: chroma-lar's detectors and the TriChroma it pins (youngsm/trichroma@fcae69c)
       - "chroma-lar @ git+https://github.com/youngsm/chroma-lar.git@177b89d"

@@ -198,3 +198,36 @@ def test_main_subprocess_one_event(out_h5_path, tmp_path):
     # Print sanity: the per-event timing row must include the t_vox column.
     assert "t_vox" in res.stdout
     assert "Average:" in res.stdout
+
+
+def test_load_step_event(tmp_path):
+    """A jaxtpc step file decodes to global mm, ceil'd photons, ns times and volume labels."""
+    import h5py
+    import numpy as np
+
+    spec = importlib.util.spec_from_file_location("run_batch_smoke_mod", str(RUN_BATCH))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    path = tmp_path / "step.h5"
+    with h5py.File(path, "w") as f:
+        evt = f.create_group("entry_000000")
+        evt.attrs["n_volumes"] = 2
+        empty = evt.create_group("volume_0")
+        empty.attrs["n_actual"] = 0
+        vg = evt.create_group("volume_1")
+        vg.attrs.update(n_actual=2, pos_step_mm=0.3,
+                        pos_origin_x=10.0, pos_origin_y=-20.0, pos_origin_z=5.0)
+        vg["positions"] = np.array([[0, 0, 0], [10, 20, 30]], dtype=np.uint16)
+        vg["photons"] = np.array([1.2, 3.0], dtype=np.float32)
+        vg["t0_us"] = np.array([0.5, 2.0], dtype=np.float16)
+        vg["de"] = np.array([0.1, 0.2], dtype=np.float16)
+
+    assert module.is_step_file(str(path))
+    assert module.get_num_events(str(path)) == 1
+    pos, nph, tns, lbl, pdg, de, n = module.load_step_event(str(path), 0)
+    np.testing.assert_allclose(pos, [[10, -20, 5], [13, -14, 14]], atol=1e-5)
+    np.testing.assert_array_equal(nph, [2, 3])
+    np.testing.assert_allclose(tns, [500.0, 2000.0])
+    np.testing.assert_array_equal(lbl, [1, 1])
+    assert pdg is None and n == 2 and de.shape == (2,)
