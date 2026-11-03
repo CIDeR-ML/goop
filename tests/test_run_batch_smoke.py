@@ -149,8 +149,9 @@ def test_sampler_chroma_replaces_yaml_lut(tmp_path):
     shutil.which("python") is None,
     reason="No python available for subprocess smoke",
 )
-def test_main_subprocess_one_event(out_h5_path, tmp_path):
-    """End-to-end production smoke: 1 event, LUT, --voxel-dx 10, interaction labels.
+@pytest.mark.parametrize("sampler, min_free_mb", [("lut", 28_000), ("chroma", 9_000)])
+def test_main_subprocess_one_event(out_h5_path, tmp_path, sampler, min_free_mb):
+    """End-to-end production smoke: 1 event per sampler, --voxel-dx 10, interaction labels.
 
     This is the only test that catches print-format-string bugs (``t_vox``,
     ``n_after``) and other run-time issues introduced by merges. Skipped
@@ -161,8 +162,8 @@ def test_main_subprocess_one_event(out_h5_path, tmp_path):
         pytest.skip("smoke test needs a GPU")
     free_mb = (torch.cuda.mem_get_info()[0] // (1024 * 1024)
                if hasattr(torch.cuda, "mem_get_info") else 0)
-    if free_mb < 28_000:
-        pytest.skip(f"need ~28 GB free GPU for LUT-eager; have {free_mb} MB")
+    if free_mb < min_free_mb:
+        pytest.skip(f"need ~{min_free_mb // 1000} GB free GPU for {sampler}; have {free_mb} MB")
 
     out = tmp_path / "out"
     out.mkdir()
@@ -177,9 +178,14 @@ def test_main_subprocess_one_event(out_h5_path, tmp_path):
         "--events-per-file", "1",
         "--workers", "0",
         "--label-key", "interaction",
-        "--sampler", "lut",
+        "--sampler", sampler,
         "--voxel-dx", "10",
     ]
+    if sampler == "chroma":
+        # smaller TriChroma batches than the default 50M, so the event fits on 11 GB GPUs
+        run_config = tmp_path / "run.yml"
+        run_config.write_text("sampler:\n  type: chroma\n  photons_per_batch: 5000000\n", encoding="utf-8")
+        cmd += ["--run-config", str(run_config)]
     env = dict(os.environ)
     env.setdefault("CUDA_VISIBLE_DEVICES", "0")
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -195,6 +201,9 @@ def test_main_subprocess_one_event(out_h5_path, tmp_path):
     opticals = list((out / "sensor_optical").glob("*.h5"))
     assert len(opticals) == 1, f"expected one optical file, got {opticals}"
     assert opticals[0].stat().st_size > 0
+    import h5py
+    with h5py.File(opticals[0], "r") as f:
+        assert f["config"].attrs["sampler_type"] == sampler
     # Print sanity: the per-event timing row must include the t_vox column.
     assert "t_vox" in res.stdout
     assert "Average:" in res.stdout

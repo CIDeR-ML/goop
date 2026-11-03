@@ -1,14 +1,10 @@
 """ChromaTOFSampler: photons propagated through a chroma-lar detector by TriChroma."""
 
-import importlib.util
-
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or importlib.util.find_spec("chroma_lar") is None,
-    reason="needs a CUDA GPU and chroma-lar (with TriChroma)",
-)
+# chroma-lar is a required dependency, so only a missing GPU skips these tests.
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
 
 @pytest.fixture(scope="module")

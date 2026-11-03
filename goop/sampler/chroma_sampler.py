@@ -12,22 +12,12 @@ from __future__ import annotations
 import math
 
 import torch
+from chroma.event import Event
+from chroma.sim import Simulation
+from chroma.triton.sources import SourcePhotons
+from chroma_lar.geometry import build_detector_from_config
 
 from ..base import TOFSamplerBase
-
-
-def require_trichroma():
-    """Raise unless chroma-lar and a TriChroma this sampler can use are installed."""
-    from chroma.backend import backend_name
-
-    if backend_name() != "triton":
-        raise RuntimeError("ChromaTOFSampler needs Chroma's Triton backend; unset CHROMA_BACKEND")
-    import chroma_lar.geometry  # noqa: F401
-    from chroma.event import Photons
-
-    if not hasattr(Photons(), "index"):
-        raise RuntimeError("ChromaTOFSampler needs a TriChroma whose hits carry the input photon index "
-                           "(youngsm/trichroma#3)")
 
 
 class ChromaTOFSampler(TOFSamplerBase):
@@ -49,16 +39,10 @@ class ChromaTOFSampler(TOFSamplerBase):
     def __init__(self, detector_config: str = "detector_config_reflect_reflect3wires",
                  wavelength: float = 450.0, pmt_qe: float = 0.12, seed: int | None = None,
                  photons_per_batch: int = 50_000_000, max_steps: int = 1000, device: str = "cuda:0"):
-        require_trichroma()
-        from chroma.sim import Simulation
-        from chroma_lar.geometry import build_detector_from_config
-
         self._device = torch.device(device)
         detector = build_detector_from_config(detector_config, flatten=True)
         self._n_channels = int(detector.num_channels())
         self._sim = Simulation(detector, seed=seed, cuda_device=self._device.index)
-        if not hasattr(self._sim, "_next_photon_id"):
-            raise RuntimeError("ChromaTOFSampler needs TriChroma's Simulation._next_photon_id photon counter")
         self._wavelength = float(wavelength)
         self._pmt_qe = float(pmt_qe)
         self._photons_per_batch = int(photons_per_batch)
@@ -104,8 +88,6 @@ class ChromaTOFSampler(TOFSamplerBase):
 
     def _photons(self, pos, t):
         """Isotropic, randomly polarised photons at ``pos`` and times ``t``."""
-        from chroma.triton.sources import SourcePhotons
-
         n, dev = len(pos), self._device
         u = torch.rand((4, n), device=dev)
         cos = u[0:2] * 2 - 1
@@ -123,8 +105,6 @@ class ChromaTOFSampler(TOFSamplerBase):
 
     @staticmethod
     def _events(photons, starts):
-        from chroma.event import Event
-
         for start, end in zip(starts[:-1], starts[1:]):
             yield Event(photons_beg=photons[start:end])
 
